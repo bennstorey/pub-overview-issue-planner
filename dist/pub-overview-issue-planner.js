@@ -21,7 +21,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '0.4.0';
+  var VERSION = '0.4.1';
   var TAG = '[issue-creator]';
 
   if (typeof PoUiSdk === 'undefined') {
@@ -401,31 +401,71 @@
   //     creating anything. `IssuePlan_<issueId>` in `_Issue Plans`, one per
   //     issue, overwritten on each save.
   //
-  // The PoC proved this shape server-side (object type `Other`, format
-  // text/plain, contained in a dossier). It uploaded the bytes to the Transfer
-  // Server first; here the JSON rides inline as base64 in the Attachment's
-  // Content, which avoids a second endpoint the browser has never been shown to
-  // accept uploads on.
+  // The PoC proved this shape server-side: object type `Other`, format
+  // text/plain, contained in a dossier, with the bytes uploaded to the Transfer
+  // Server first and referenced by FileUrl.
+  //
+  // Sending the JSON inline as base64 in the Attachment's Content was tried
+  // first, to avoid a second endpoint — the server rejects it with "Unable to
+  // save attached data to file (S1001)". So the Transfer Server it is; the only
+  // new part versus the PoC is authenticating with the cookie session (ww-app)
+  // instead of a ticket.
 
   var ISSUE_TEMPLATE_DOSSIER = '_Issue Templates';
   var ISSUE_TEMPLATE_PREFIX = 'IssueTemplate_';
   var PLAN_DOSSIER = '_Issue Plans';
   var PLAN_PREFIX = 'IssuePlan_';
 
-  function toBase64(text) {
-    // btoa() is latin-1 only; go via UTF-8 bytes so template names with
-    // accents or dashes survive the round trip.
-    var bytes = new TextEncoder().encode(text);
-    var bin = '';
-    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-    return btoa(bin);
-  }
-
+  // Only needed for reading: a server that hands content back inline. atob() is
+  // latin-1, so go via UTF-8 bytes or template names with accents come back
+  // mangled.
   function fromBase64(b64) {
     var bin = atob(b64);
     var bytes = new Uint8Array(bin.length);
     for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
     return new TextDecoder().decode(bytes);
+  }
+
+  // Upload bytes to the Transfer Server and return a FileUrl usable in an
+  // Attachment. A ticket is used when the session has one; otherwise ww-app
+  // makes the session cookie apply, the same trick that lets rendition
+  // downloads work from the browser.
+  function uploadToTransfer(text, mime) {
+    var guid = (window.crypto && window.crypto.randomUUID)
+      ? window.crypto.randomUUID()
+      : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+          var r = Math.random() * 16 | 0;
+          return (c === 'x' ? r : ((r & 0x3) | 0x8)).toString(16);
+        });
+
+    var base = serverUrl('transferindex.php');
+    var ticket = getTicket();
+    var auth = ticket ? 'ticket=' + encodeURIComponent(ticket) : 'ww-app=' + encodeURIComponent(WW_APP);
+    var uploadUrl = base + '?' + auth + '&fileguid=' + encodeURIComponent(guid) +
+      '&format=' + encodeURIComponent(mime);
+    var blob = new Blob([text], { type: mime });
+
+    function attempt(method) {
+      return fetch(uploadUrl, {
+        method: method,
+        credentials: 'same-origin',
+        headers: Object.assign({ 'Content-Type': mime }, WW_APP_HEADER),
+        body: blob,
+      });
+    }
+
+    // Some proxies refuse PUT; the PoC carried the same POST fallback.
+    return attempt('PUT').then(function (res) {
+      if (res.ok) return res;
+      return attempt('POST');
+    }).then(function (res) {
+      if (!res.ok) {
+        return res.text().then(function (body) {
+          throw new Error('Transfer upload failed: HTTP ' + res.status + ' ' + String(body).slice(0, 200));
+        });
+      }
+      return base + '?fileguid=' + encodeURIComponent(guid) + '&format=' + encodeURIComponent(mime);
+    });
   }
 
   function findObjectsByName(publicationId, name, operation) {
@@ -489,7 +529,13 @@
   }
 
   function saveJsonObject(name, publicationId, categoryId, dossierName, data) {
-    return findOrCreateDossier(dossierName, publicationId, categoryId).then(function (dossierId) {
+    var json = JSON.stringify(data, null, 2);
+    return Promise.all([
+      findOrCreateDossier(dossierName, publicationId, categoryId),
+      uploadToTransfer(json, 'text/plain'),
+    ]).then(function (r) {
+      var dossierId = r[0];
+      var fileUrl = r[1];
       return callServer('CreateObjects', {
         Lock: false, Messages: null, AutoNaming: false, ReplaceGUIDs: null,
         Objects: [{
@@ -507,7 +553,7 @@
             __classname__: 'Attachment',
             Rendition: 'native',
             Type: 'text/plain',
-            Content: toBase64(JSON.stringify(data, null, 2)),
+            FileUrl: fileUrl,
           }],
         }],
       }).then(function (res) {

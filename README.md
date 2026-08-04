@@ -175,12 +175,18 @@ pages: those belong to the issue, not the plan, and are re-read fresh every time
 saved arrangement is restored, entries whose pages have been created in the meantime are
 skipped and reported rather than silently dropped.
 
-⚠️ **The storage write path is not yet verified against the server.** The PoC proved this
-object shape works, but it uploaded the bytes to the Transfer Server first; here the JSON
-rides inline as base64 in the Attachment's `Content`, which avoids an endpoint the browser
-has never been shown to accept uploads on. `Content` is a documented field on `Attachment`,
-but if the server rejects it, the fallback is the Transfer Server route the PoC used —
-`loadJsonObject` already handles a `FileUrl` coming back instead of inline content.
+### How the bytes get there
+
+The JSON is uploaded to the **Transfer Server** and referenced by `FileUrl`, as the PoC
+did. The only difference is authentication: the PoC had a ticket, the plug-in has a cookie
+session, so the upload carries `ww-app` — the same parameter that makes rendition
+downloads work from the browser.
+
+Sending the JSON inline as base64 in the Attachment's `Content` was tried first, to avoid
+a second endpoint. **The server rejects it**: `Unable to save attached data to file
+(S1001) — Missing function parameter (S1000)`. `Content` is a documented field on
+`Attachment`, but this server will not accept it. Reading still handles inline content in
+case another version returns it that way.
 
 ## Notes
 
