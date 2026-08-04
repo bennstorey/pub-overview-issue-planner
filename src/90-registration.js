@@ -31,6 +31,10 @@
     nameSlots: nameSlots,
     open: openPlannerDialog,
     strategy: function () { return strategy; },
+    grid: grid,
+    plannedSlots: plannedSlots,
+    gridCounts: gridCounts,
+    loadThumbUrls: loadThumbUrls,
   };
 
   console.info(TAG + ' v' + VERSION + ' loaded');

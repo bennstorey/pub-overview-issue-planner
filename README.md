@@ -7,22 +7,23 @@ numbers already set.
 
 No InDesign, no file upload, no second login. Supersedes the Electron PoC in `../app`.
 
-## Status: scaffold
+## Status: working
 
-The plumbing is built and verified; the slot grid and template gallery are not yet ported.
+Open **Create pages…** in the Publication Overview triple-dot menu:
 
-What works now — open **Create pages…** in the Publication Overview triple-dot menu:
+- Resolves the brand, issue, channel and section from the current filter, so it never asks
+  what you are looking at
+- Builds a slot grid, seeded from the issue's own expected page count
+- Pages already in the issue render **locked and green**, showing the layout name and
+  workflow state, and the grid extends if they run past the requested count
+- Click a page, then a template, to assign it. Multi-page templates span consecutive pages
+  and the selection auto-advances past the spread. `×` clears
+- Templates list with thumbnails and page counts; the blank-page template is auto-detected
+- **Create** sends the whole plan in one `CreateLayouts` call, then re-reads the issue to
+  verify the pages actually landed
 
-- Resolves the brand, issue, channel and section from `PoUiSdk.currentFilterSetting()`,
-  so it never asks what you are looking at
-- Checks that the planning endpoint accepts your session
-- Lists the brand's layout templates with their page counts, and guesses the blank-page one
-- Reports which pages of the issue are already occupied
-- **Confirm protocol** creates one throwaway layout to pin down the `__classname__`
-  strategy the server wants (see below)
-
-Still to build: the slot grid, the template gallery with thumbnails, saved issue templates
-and plan drafts, and the create run itself.
+Still to build: saved issue templates and reusable plan drafts, per-slot category and
+edition overrides, and a page-range/section view for very large issues.
 
 ## Build
 
@@ -73,16 +74,34 @@ customer context stay in the private parent repo.
 ```
 src/                      concatenated in filename order by build-plugin.js
 ├── 00-header.js          IIFE open, PoUiSdk guard, VERSION
+├── 05-dom.js             el() helper, shared by the grid and the dialog
 ├── 10-config.js          naming defaults, localStorage settings
 ├── 20-studio-api.js      cookie-session JSON-RPC for index.php and editorialplan.php
 ├── 30-planning-api.js    CreateLayouts, access check, protocol confirmation
 ├── 40-issue-data.js      GetPagesInfo issue model, brand/issue/section name resolution
 ├── 50-templates.js       LayoutTemplate query, page counts from PageRange
+├── 55-renditions.js      thumbnail URLs (needs ww-app for the cookie session)
 ├── 60-naming.js          naming-pattern engine (ported from the PoC)
+├── 65-slot-grid.js       slot model — spans, covered pages, locked existing pages
 ├── 70-planner-dialog.js  the modal
 ├── 90-registration.js    menu action, window.__issueCreator diagnostics
 └── 99-footer.js          IIFE close
 ```
+
+### The slot model
+
+Ported from the Electron PoC, where it was proven across several real issue builds. A slot
+is one page. A multi-page template gives its slot a `span`, and the pages underneath become
+`covered` — they still exist so page numbering stays honest, but they are not drawn and
+cannot be assigned to. `existing` marks a page already in the issue: locked, and never
+touched by a create run.
+
+Assigning over an earlier spread clears that whole spread, and assigning across a page that
+already exists in the issue is refused rather than silently skipped.
+
+Note `GetPagesInfo` returns one PageObject per page *per edition*, so the same page arrives
+more than once when no single edition is selected; spans are collapsed per layout to
+compensate.
 
 ## The `__classname__` problem
 

@@ -21,7 +21,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '0.1.2';
+  var VERSION = '0.2.0';
   var TAG = '[issue-creator]';
 
   if (typeof PoUiSdk === 'undefined') {
@@ -29,6 +29,21 @@
     // slot in the Management Console) — do nothing, never break the page.
     console.warn(TAG + ' PoUiSdk not available — plug-in not loaded in a Publication Overview context.');
     return;
+  }
+
+  // ─── DOM helper ────────────────────────────────────────────────────────────
+  // Shared by the grid and the dialog, so it lives ahead of both.
+
+  function el(tag, props, children) {
+    var node = document.createElement(tag);
+    props = props || {};
+    Object.keys(props).forEach(function (k) {
+      if (k === 'text') node.textContent = props[k];
+      else if (k === 'class') node.className = props[k];
+      else node.setAttribute(k, props[k]);
+    });
+    (children || []).forEach(function (c) { if (c) node.appendChild(c); });
+    return node;
   }
 
   // ─── Defaults ──────────────────────────────────────────────────────────────
@@ -420,6 +435,74 @@
     return null;
   }
 
+  // ─── Thumbnails ────────────────────────────────────────────────────────────
+  // Studio's rendition FileUrls point at the Transfer Server, which returns
+  // HTTP 400 ("Please specify ticket param") unless ww-app is present — with it,
+  // the session cookie applies. Same quirk the PDF plug-in documents, and it
+  // means an <img src> works directly without fetching bytes ourselves.
+
+  var thumbCache = {}; // objectId -> url | null
+
+  function withWwApp(url) {
+    if (url.indexOf('ww-app=') !== -1) return url;
+    return url + (url.indexOf('?') >= 0 ? '&' : '?') + 'ww-app=' + encodeURIComponent(WW_APP);
+  }
+
+  // Returns { id: url } for the ids it could resolve. Cached, so re-rendering
+  // the grid is free and only genuinely new ids cost a request.
+  function loadThumbUrls(ids) {
+    var wanted = [];
+    for (var i = 0; i < ids.length; i++) {
+      var id = String(ids[i]);
+      if (id && !(id in thumbCache) && wanted.indexOf(id) === -1) wanted.push(id);
+    }
+    if (!wanted.length) return Promise.resolve(pickCached(ids));
+
+    return callServer('GetObjects', {
+      IDs: wanted,
+      Lock: false,
+      Rendition: 'thumb',
+      RequestInfo: [],
+      HaveVersions: null,
+      Areas: null,
+      EditionId: null,
+      SupportedContentSources: null,
+    }).then(function (r) {
+      var objs = r.Objects || [];
+      for (var o = 0; o < objs.length; o++) {
+        var obj = objs[o];
+        var oid = obj.MetaData && obj.MetaData.BasicMetaData && String(obj.MetaData.BasicMetaData.ID);
+        if (!oid) continue;
+        var url = null;
+        var files = obj.Files || [];
+        for (var f = 0; f < files.length; f++) {
+          if (files[f].Rendition === 'thumb' && files[f].FileUrl) { url = withWwApp(files[f].FileUrl); break; }
+        }
+        thumbCache[oid] = url;
+      }
+      // Anything the server did not return gets a negative entry so we stop asking.
+      for (var w = 0; w < wanted.length; w++) {
+        if (!(wanted[w] in thumbCache)) thumbCache[wanted[w]] = null;
+      }
+      return pickCached(ids);
+    }).catch(function (e) {
+      console.warn(TAG + ' thumbnail load failed: ' + e.message);
+      for (var w2 = 0; w2 < wanted.length; w2++) thumbCache[wanted[w2]] = null;
+      return pickCached(ids);
+    });
+  }
+
+  function pickCached(ids) {
+    var out = {};
+    for (var i = 0; i < ids.length; i++) {
+      var id = String(ids[i]);
+      if (thumbCache[id]) out[id] = thumbCache[id];
+    }
+    return out;
+  }
+
+  function thumbUrl(id) { return thumbCache[String(id)] || null; }
+
   // ─── Naming patterns ───────────────────────────────────────────────────────
   // Ported unchanged from the Electron PoC, where it was exercised across
   // several real issue builds. Tokens: {issue} {brand} {template} {page}
@@ -459,29 +542,309 @@
     });
   }
 
+  // ─── Slot grid ─────────────────────────────────────────────────────────────
+  // Ported from the Electron PoC, where the span/covered-slot model was proven
+  // across several real issue builds.
+  //
+  // A slot is one page. A multi-page template assigned to a slot gives it a
+  // span, and the pages it covers become `covered` slots — they still exist so
+  // page numbering stays honest, but they are not rendered and cannot be
+  // assigned to. `existing` marks a page already in the issue: locked, never
+  // touched by a create run.
+
+  var grid = {
+    slots: [],        // [{ page, templateId, templateName, span, covered, existing }]
+    selected: null,   // index of the selected slot
+    onChange: null,   // called after any mutation so the dialog can re-render
+  };
+
+  function pad3(n) { return String(n).padStart(3, '0'); }
+
+  function buildSlots(firstPage, count) {
+    grid.slots = [];
+    for (var i = 0; i < count; i++) {
+      grid.slots.push({ page: firstPage + i, templateId: null, templateName: null, span: 1, covered: false });
+    }
+    grid.selected = null;
+  }
+
+  // A covered slot belongs to the spanned slot that starts before it.
+  function ownerIndex(i) {
+    var k = i;
+    while (k > 0 && grid.slots[k].covered) k--;
+    return k;
+  }
+
+  function slotAt(page) {
+    for (var i = 0; i < grid.slots.length; i++) if (grid.slots[i].page === page) return i;
+    return -1;
+  }
+
+  function clearSlotSpan(i) {
+    var o = ownerIndex(i);
+    var span = grid.slots[o].span || 1;
+    for (var j = o; j < o + span && j < grid.slots.length; j++) {
+      grid.slots[j] = { page: grid.slots[j].page, templateId: null, templateName: null, span: 1, covered: false };
+    }
+  }
+
+  // GetPagesInfo returns one PageObject per page per edition, so the same page
+  // can appear more than once; collapse to one span per layout.
+  function existingSpans(model) {
+    var byLayout = {};
+    var pages = model.pages || [];
+    for (var i = 0; i < pages.length; i++) {
+      var p = pages[i];
+      if (!p.layoutId || !p.pageOrder) continue;
+      var e = byLayout[p.layoutId];
+      if (!e) byLayout[p.layoutId] = { layoutId: p.layoutId, start: p.pageOrder, end: p.pageOrder };
+      else {
+        if (p.pageOrder < e.start) e.start = p.pageOrder;
+        if (p.pageOrder > e.end) e.end = p.pageOrder;
+      }
+    }
+    return Object.keys(byLayout).map(function (id) {
+      var span = byLayout[id];
+      var meta = (model.layouts || {})[id] || {};
+      span.name = meta.name || ('layout ' + id);
+      span.stateName = meta.stateName || '';
+      span.lockedBy = meta.lockedBy || '';
+      return span;
+    }).sort(function (a, b) { return a.start - b.start; });
+  }
+
+  // Lock the pages already in the issue, extending the grid if they run past
+  // the requested page count.
+  function overlayExisting(model) {
+    var spans = existingSpans(model);
+    if (!spans.length) return 0;
+
+    var first = grid.slots.length ? grid.slots[0].page : 1;
+    var last = grid.slots.length ? grid.slots[grid.slots.length - 1].page : 0;
+    var maxPage = spans[spans.length - 1].end;
+    for (var pg = last + 1; pg <= maxPage; pg++) {
+      grid.slots.push({ page: pg, templateId: null, templateName: null, span: 1, covered: false });
+    }
+
+    var placed = 0;
+    for (var s = 0; s < spans.length; s++) {
+      var sp = spans[s];
+      if (sp.end < first) continue;
+      var i = slotAt(Math.max(sp.start, first));
+      if (i < 0) continue;
+      var span = sp.end - grid.slots[i].page + 1;
+      if (span < 1) continue;
+
+      for (var j = i; j < i + span && j < grid.slots.length; j++) {
+        if (grid.slots[j].templateId || grid.slots[j].covered) clearSlotSpan(j);
+      }
+      grid.slots[i] = {
+        page: grid.slots[i].page, templateId: null, templateName: null,
+        span: span, covered: false,
+        existing: { id: sp.layoutId, name: sp.name, stateName: sp.stateName, lockedBy: sp.lockedBy },
+      };
+      for (var k = i + 1; k < i + span && k < grid.slots.length; k++) {
+        grid.slots[k] = { page: grid.slots[k].page, templateId: null, templateName: null, span: 1, covered: true };
+      }
+      placed++;
+    }
+    return placed;
+  }
+
+  // Returns an error string, or null on success.
+  function assignTemplate(template) {
+    if (grid.selected === null) return 'Select a page first.';
+    var i = grid.selected;
+    var span = template.pageCount || 1;
+
+    if (i + span > grid.slots.length) {
+      return '"' + template.name + '" is ' + span + ' pages but only ' +
+        (grid.slots.length - i) + ' remain from p' + pad3(grid.slots[i].page) + '.';
+    }
+    // Never write over a page that already exists in the issue.
+    for (var j = i; j < i + span; j++) {
+      var owner = grid.slots[j].covered ? grid.slots[ownerIndex(j)] : grid.slots[j];
+      if (owner.existing) {
+        return '"' + template.name + '" would overlap p' + pad3(grid.slots[j].page) +
+          ', already in this issue ("' + owner.existing.name + '").';
+      }
+    }
+    // Clear anything the new span overlaps, including spreads starting earlier.
+    for (var c = i; c < i + span; c++) {
+      if (grid.slots[c].templateId || grid.slots[c].covered) clearSlotSpan(c);
+    }
+
+    grid.slots[i] = {
+      page: grid.slots[i].page, templateId: template.id, templateName: template.name,
+      span: span, covered: false,
+    };
+    for (var k = i + 1; k < i + span; k++) {
+      grid.slots[k] = { page: grid.slots[k].page, templateId: null, templateName: null, span: 1, covered: true };
+    }
+
+    // Auto-advance past the spread to the next assignable slot.
+    var next = i + span;
+    while (next < grid.slots.length && (grid.slots[next].covered || grid.slots[next].existing)) next++;
+    grid.selected = next < grid.slots.length ? next : null;
+    return null;
+  }
+
+  // The slots a create run should act on: assigned, not covered, not existing.
+  // Empty slots are included only when a blank template is configured.
+  function plannedSlots(blankTemplate) {
+    var out = [];
+    for (var i = 0; i < grid.slots.length; i++) {
+      var s = grid.slots[i];
+      if (s.covered || s.existing) continue;
+      if (s.templateId) {
+        out.push({
+          page: s.page, pageEnd: s.page + (s.span || 1) - 1,
+          templateId: s.templateId, templateName: s.templateName,
+        });
+      } else if (blankTemplate) {
+        out.push({
+          page: s.page, pageEnd: s.page + (blankTemplate.pageCount || 1) - 1,
+          templateId: blankTemplate.id, templateName: blankTemplate.name,
+        });
+      }
+    }
+    return out;
+  }
+
+  function gridCounts() {
+    var assigned = 0, empty = 0, existing = 0;
+    for (var i = 0; i < grid.slots.length; i++) {
+      var s = grid.slots[i];
+      if (s.covered) continue;
+      if (s.existing) existing++;
+      else if (s.templateId) assigned++;
+      else empty++;
+    }
+    return { assigned: assigned, empty: empty, existing: existing };
+  }
+
+  // ─── Rendering ─────────────────────────────────────────────────────────────
+
+  function renderGrid(container) {
+    container.textContent = '';
+    var pending = [];
+
+    grid.slots.forEach(function (slot, i) {
+      if (slot.covered) return; // drawn as part of the owning spread
+      var span = slot.span || 1;
+
+      var classes = 'ic-slot';
+      if (grid.selected === i) classes += ' ic-selected';
+      if (slot.templateId) classes += ' ic-filled';
+      if (slot.existing) classes += ' ic-existing';
+
+      var node = el('div', { class: classes });
+      if (span > 1) node.style.gridColumn = 'span ' + span;
+
+      var thumbId = slot.existing ? slot.existing.id : slot.templateId;
+      var thumbBox = el('div', { class: 'ic-slot-thumb' });
+      var url = thumbId ? thumbUrl(thumbId) : null;
+      if (url) {
+        thumbBox.appendChild(el('img', { src: url, alt: '' }));
+      } else {
+        thumbBox.appendChild(el('span', { class: 'ic-slot-empty', text: thumbId ? '…' : 'blank' }));
+        if (thumbId) pending.push(String(thumbId));
+      }
+
+      var label = span > 1
+        ? 'p' + pad3(slot.page) + '–p' + pad3(slot.page + span - 1)
+        : 'p' + pad3(slot.page);
+      var pageLine = el('div', { class: 'ic-slot-page' }, [el('span', { text: label })]);
+      if (span > 1) pageLine.appendChild(el('span', { class: 'ic-badge', text: span + '-page' }));
+      if (slot.existing) pageLine.appendChild(el('span', { class: 'ic-badge ic-badge-existing', text: 'in issue' }));
+
+      var sub = slot.existing
+        ? slot.existing.name + (slot.existing.stateName ? ' · ' + slot.existing.stateName : '')
+        : (slot.templateName || '—');
+
+      node.appendChild(thumbBox);
+      node.appendChild(pageLine);
+      node.appendChild(el('div', { class: 'ic-slot-tpl', title: sub, text: sub }));
+
+      if (slot.templateId && !slot.existing) {
+        var clear = el('button', { class: 'ic-slot-clear', title: 'Clear', text: '×' });
+        clear.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+          clearSlotSpan(i);
+          if (grid.onChange) grid.onChange();
+        });
+        node.appendChild(clear);
+      }
+
+      if (!slot.existing) {
+        node.addEventListener('click', function () {
+          grid.selected = (grid.selected === i) ? null : i;
+          if (grid.onChange) grid.onChange();
+        });
+      } else {
+        node.title = slot.existing.lockedBy
+          ? 'Locked — in use by ' + slot.existing.lockedBy
+          : 'Already in this issue';
+      }
+
+      container.appendChild(node);
+    });
+
+    // Thumbnails we did not have yet: fetch, then redraw once.
+    if (pending.length) {
+      loadThumbUrls(pending).then(function () {
+        if (grid.onChange) grid.onChange();
+      });
+    }
+  }
+
   // ─── Planner dialog ────────────────────────────────────────────────────────
-  // SCAFFOLD: this proves the whole plumbing end to end — context resolution,
-  // planning-endpoint access, template listing, occupied-page detection — and
-  // hosts the protocol confirmation. The slot grid and template gallery from the
-  // Electron PoC land here next.
+  // Hosts the slot grid and the template list. Context comes from the current
+  // Publication Overview filter, so the dialog never asks which issue you mean.
 
   var DIALOG_CSS = [
     '.ic-overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:99999;display:flex;align-items:center;justify-content:center}',
-    '.ic-dialog{background:#fff;color:#222;border-radius:6px;min-width:560px;max-width:80vw;max-height:80vh;',
+    '.ic-dialog{background:#fff;color:#222;border-radius:6px;width:1040px;max-width:94vw;height:80vh;',
     '  display:flex;flex-direction:column;font:13px/1.5 system-ui,sans-serif;box-shadow:0 8px 40px rgba(0,0,0,.35)}',
-    '.ic-dialog h2{margin:0;padding:14px 18px;border-bottom:1px solid #e3e3e3;font-size:15px;font-weight:600}',
-    '.ic-body{padding:14px 18px;overflow:auto}',
-    '.ic-body dl{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;margin:0 0 12px}',
-    '.ic-body dt{color:#666}',
-    '.ic-body dd{margin:0}',
-    '.ic-list{max-height:180px;overflow:auto;border:1px solid #e3e3e3;border-radius:4px;padding:6px 10px;margin:0 0 12px}',
-    '.ic-list div{padding:2px 0}',
-    '.ic-muted{color:#777}',
-    '.ic-ok{color:#137333}',
-    '.ic-bad{color:#c5221f}',
-    '.ic-actions{padding:12px 18px;border-top:1px solid #e3e3e3;display:flex;justify-content:flex-end;gap:8px}',
+    '.ic-dialog h2{margin:0;padding:12px 18px;border-bottom:1px solid #e3e3e3;font-size:15px;font-weight:600;',
+    '  display:flex;align-items:baseline;gap:10px}',
+    '.ic-ctx{font-weight:400;font-size:12px;color:#666}',
+    '.ic-main{flex:1;display:flex;min-height:0}',
+    '.ic-left{flex:1;display:flex;flex-direction:column;min-width:0;border-right:1px solid #e3e3e3}',
+    '.ic-toolbar{padding:8px 14px;border-bottom:1px solid #eee;display:flex;align-items:center;gap:10px;flex-wrap:wrap}',
+    '.ic-toolbar input[type=number]{width:64px;padding:3px 6px;border:1px solid #ccc;border-radius:3px}',
+    '.ic-toolbar input[type=text]{flex:1;min-width:150px;padding:3px 6px;border:1px solid #ccc;border-radius:3px;font-family:ui-monospace,monospace;font-size:12px}',
+    '.ic-grid{flex:1;overflow-y:auto;display:grid;grid-template-columns:repeat(auto-fill,minmax(112px,1fr));',
+    '  gap:10px;padding:14px;align-content:start}',
+    '.ic-slot{position:relative;border:2px dashed #ccc;border-radius:6px;padding:6px;cursor:pointer;text-align:center;background:#fafafa}',
+    '.ic-slot.ic-filled{border-style:solid;border-color:#9aa0a6;background:#fff}',
+    '.ic-slot.ic-selected{border-color:#1a73e8;box-shadow:0 0 0 2px rgba(26,115,232,.3)}',
+    '.ic-slot.ic-existing{border-style:solid;border-color:#2f7d4f;background:#f2f8f4;cursor:default;opacity:.85}',
+    '.ic-slot.ic-existing .ic-slot-thumb{filter:grayscale(35%)}',
+    '.ic-slot-thumb{height:96px;display:flex;align-items:center;justify-content:center;background:#eee;border-radius:4px;overflow:hidden}',
+    '.ic-slot-thumb img{max-width:100%;max-height:100%}',
+    '.ic-slot-empty{color:#999;font-size:11px}',
+    '.ic-slot-page{font-weight:700;font-size:11px;margin-top:5px;display:flex;gap:4px;justify-content:center;align-items:center;flex-wrap:wrap}',
+    '.ic-badge{font-weight:600;font-size:9px;background:#e8eaed;color:#444;border-radius:8px;padding:1px 6px}',
+    '.ic-badge-existing{background:#d7eade;color:#1d6b3d}',
+    '.ic-slot-tpl{font-size:10px;color:#777;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+    '.ic-slot-clear{position:absolute;top:3px;right:3px;width:19px;height:19px;padding:0;line-height:1;',
+    '  border-radius:50%;border:1px solid #ccc;background:#fff;cursor:pointer;font-size:12px}',
+    '.ic-right{width:280px;display:flex;flex-direction:column;min-height:0}',
+    '.ic-right h3{margin:0;padding:10px 14px;font-size:12px;font-weight:600;color:#555;border-bottom:1px solid #eee}',
+    '.ic-templates{flex:1;overflow-y:auto;padding:6px}',
+    '.ic-tpl{display:flex;gap:8px;align-items:center;padding:6px;border-radius:4px;cursor:pointer;border:1px solid transparent}',
+    '.ic-tpl:hover{background:#f1f3f4;border-color:#dadce0}',
+    '.ic-tpl-thumb{width:38px;height:44px;flex:none;background:#eee;border-radius:3px;display:flex;align-items:center;justify-content:center;overflow:hidden}',
+    '.ic-tpl-thumb img{max-width:100%;max-height:100%}',
+    '.ic-tpl-name{font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+    '.ic-tpl-meta{font-size:10px;color:#888}',
+    '.ic-status{padding:8px 18px;border-top:1px solid #e3e3e3;font-size:12px;color:#555;min-height:19px}',
+    '.ic-actions{padding:10px 18px;border-top:1px solid #e3e3e3;display:flex;justify-content:space-between;align-items:center;gap:8px}',
     '.ic-actions button{padding:6px 14px;border-radius:4px;border:1px solid #bbb;background:#f6f6f6;cursor:pointer}',
     '.ic-actions button.ic-primary{background:#1a73e8;border-color:#1a73e8;color:#fff}',
+    '.ic-actions button[disabled]{opacity:.5;cursor:default}',
+    '.ic-muted{color:#777}.ic-ok{color:#137333}.ic-bad{color:#c5221f}',
   ].join('\n');
 
   function injectCss() {
@@ -492,18 +855,6 @@
     document.head.appendChild(style);
   }
 
-  function el(tag, props, children) {
-    var node = document.createElement(tag);
-    props = props || {};
-    Object.keys(props).forEach(function (k) {
-      if (k === 'text') node.textContent = props[k];
-      else if (k === 'class') node.className = props[k];
-      else node.setAttribute(k, props[k]);
-    });
-    (children || []).forEach(function (c) { if (c) node.appendChild(c); });
-    return node;
-  }
-
   function openPlannerDialog() {
     injectCss();
     var filter = currentFilter();
@@ -511,115 +862,192 @@
       notify('Open an issue in Publication Overview first.', 'error');
       return;
     }
+    // The filter's key names are undocumented and not all are what the notes
+    // suggest — log the raw object so a wrong assumption is visible, not silent.
+    console.info(TAG + ' currentFilterSetting():', filter);
 
-    var ctxList = el('dl');
-    var accessLine = el('div', { class: 'ic-muted', text: 'Checking planning access…' });
-    var freeLine = el('div', { class: 'ic-muted', text: '' });
-    var templateList = el('div', { class: 'ic-list', text: 'Loading templates…' });
+    var settings = loadSettings();
+    var state = { ctx: null, templates: [], model: null, blank: null, busy: false, pageCountTouched: false };
+
+    var ctxLine = el('span', { class: 'ic-ctx', text: 'resolving…' });
+    var pageCount = el('input', { type: 'number', min: '1', max: '999', value: '16' });
+    var patternInput = el('input', { type: 'text', value: settings.layoutPattern, title: 'Naming pattern' });
+    var rebuildBtn = el('button', { text: 'Rebuild grid' });
+    var gridBox = el('div', { class: 'ic-grid' });
+    var templateBox = el('div', { class: 'ic-templates', text: 'Loading…' });
+    var statusLine = el('div', { class: 'ic-status ic-muted', text: '' });
+    var countLine = el('div', { class: 'ic-muted', text: '' });
 
     var closeBtn = el('button', { text: 'Close' });
-    var confirmBtn = el('button', { class: 'ic-primary', text: 'Confirm protocol' });
-    confirmBtn.disabled = true;
+    var createBtn = el('button', { class: 'ic-primary', text: 'Create pages' });
+    createBtn.disabled = true;
 
     var dialog = el('div', { class: 'ic-dialog' }, [
-      el('h2', { text: 'Issue Creator — scaffold v' + VERSION }),
-      el('div', { class: 'ic-body' }, [ctxList, accessLine, freeLine, templateList]),
-      el('div', { class: 'ic-actions' }, [closeBtn, confirmBtn]),
+      el('h2', {}, [el('span', { text: 'Issue Creator' }), ctxLine]),
+      el('div', { class: 'ic-main' }, [
+        el('div', { class: 'ic-left' }, [
+          el('div', { class: 'ic-toolbar' }, [
+            el('span', { class: 'ic-muted', text: 'Pages' }), pageCount, rebuildBtn,
+            el('span', { class: 'ic-muted', text: 'Name' }), patternInput,
+          ]),
+          gridBox,
+        ]),
+        el('div', { class: 'ic-right' }, [
+          el('h3', { text: 'Templates — click a page, then a template' }),
+          templateBox,
+        ]),
+      ]),
+      statusLine,
+      el('div', { class: 'ic-actions' }, [countLine, el('span', {}, [closeBtn, createBtn])]),
     ]);
     var overlay = el('div', { class: 'ic-overlay' }, [dialog]);
     document.body.appendChild(overlay);
 
     function close() { if (overlay.parentNode) overlay.parentNode.removeChild(overlay); }
-    closeBtn.addEventListener('click', close);
-    overlay.addEventListener('click', function (ev) { if (ev.target === overlay) close(); });
+    closeBtn.addEventListener('click', function () { if (!state.busy) close(); });
+    overlay.addEventListener('click', function (ev) { if (ev.target === overlay && !state.busy) close(); });
 
-    function row(term, value) {
-      ctxList.appendChild(el('dt', { text: term }));
-      ctxList.appendChild(el('dd', { text: value }));
+    function setStatus(msg, kind) {
+      statusLine.className = 'ic-status ' + (kind === 'error' ? 'ic-bad' : kind === 'ok' ? 'ic-ok' : 'ic-muted');
+      statusLine.textContent = msg || '';
     }
 
-    var state = { ctx: null, templates: [], model: null };
+    function refresh() {
+      renderGrid(gridBox);
+      var c = gridCounts();
+      var willCreate = plannedSlots(state.blank).length;
+      countLine.textContent = c.assigned + ' assigned · ' + c.empty + ' empty · ' +
+        c.existing + ' already in issue' +
+        (state.blank ? ' · empty pages get "' + state.blank.name + '"' : ' · empty pages skipped');
+      createBtn.textContent = willCreate ? 'Create ' + willCreate + ' page' + (willCreate === 1 ? '' : 's') : 'Create pages';
+      createBtn.disabled = state.busy || !willCreate || !state.ctx;
+    }
+    grid.onChange = refresh;
 
-    checkPlanningAccess().then(function (ok) {
-      accessLine.className = ok ? 'ic-ok' : 'ic-bad';
-      accessLine.textContent = ok
-        ? 'Planning endpoint reachable on this session.'
-        : 'Planning endpoint rejected this session — this account may lack planning rights.';
-      confirmBtn.disabled = !ok;
-    });
+    function rebuild() {
+      var n = Math.max(1, Math.min(999, Number(pageCount.value) || 1));
+      buildSlots(1, n);
+      if (state.model) {
+        var locked = overlayExisting(state.model);
+        if (locked) setStatus(locked + ' layout(s) already in this issue are locked.');
+      }
+      refresh();
+    }
+    rebuildBtn.addEventListener('click', rebuild);
+    pageCount.addEventListener('input', function () { state.pageCountTouched = true; });
 
-    // The filter's key names are undocumented and not all are what the notes
-    // suggest — log the raw object so a wrong assumption is visible, not silent.
-    console.info(TAG + ' currentFilterSetting():', filter);
+    function renderTemplates() {
+      templateBox.textContent = '';
+      if (!state.templates.length) {
+        templateBox.appendChild(el('div', { class: 'ic-muted', text: 'No layout templates in this brand.' }));
+        return;
+      }
+      state.templates.forEach(function (t) {
+        var thumb = el('div', { class: 'ic-tpl-thumb' });
+        var url = thumbUrl(t.id);
+        if (url) thumb.appendChild(el('img', { src: url, alt: '' }));
+        var row = el('div', { class: 'ic-tpl', title: t.name }, [
+          thumb,
+          el('div', {}, [
+            el('div', { class: 'ic-tpl-name', text: t.name }),
+            el('div', {
+              class: 'ic-tpl-meta',
+              text: t.pageCount + 'pp' + (t.category ? ' · ' + t.category : '') +
+                (state.blank && state.blank.id === t.id ? ' · blank' : ''),
+            }),
+          ]),
+        ]);
+        row.addEventListener('click', function () {
+          var err = assignTemplate(t);
+          if (err) setStatus(err, 'error'); else setStatus('');
+          refresh();
+        });
+        templateBox.appendChild(row);
+      });
+    }
+
+    // ── load ──
+    buildSlots(1, Number(pageCount.value) || 16);
+    refresh();
 
     loadContextNames(filter).then(function (ctx) {
       state.ctx = ctx;
-      row('Brand', ctx.publication + ' (' + ctx.publicationId + ')');
-      row('Issue', ctx.issue + ' (' + ctx.issueId + ')');
-      row('Channel', ctx.pubChannel + ' (' + ctx.pubChannelId + ')');
-      row('Section', ctx.section
-        ? ctx.section + (ctx.sectionDefaulted ? ' — defaulted, no category selected' : '')
-        : '— none available');
+      ctxLine.textContent = ctx.publication + ' · ' + ctx.issue + ' · ' + ctx.pubChannel +
+        ' · section ' + (ctx.section || '—') + (ctx.sectionDefaulted ? ' (defaulted)' : '');
       return loadTemplates(ctx.publicationId);
     }).then(function (templates) {
       state.templates = templates;
-      templateList.textContent = '';
-      if (!templates.length) {
-        templateList.appendChild(el('div', { class: 'ic-muted', text: 'No layout templates in this brand.' }));
-        return;
-      }
-      templates.forEach(function (t) {
-        templateList.appendChild(el('div', {
-          text: t.name + '  —  ' + t.pageCount + 'pp' + (t.pageRange ? ' (' + t.pageRange + ')' : ''),
-        }));
-      });
-      var blank = guessBlankTemplate(templates, loadSettings().blankTemplateHint);
-      if (blank) templateList.appendChild(el('div', { class: 'ic-muted', text: 'Blank-page template: ' + blank.name }));
+      state.blank = guessBlankTemplate(templates, settings.blankTemplateHint);
+      renderTemplates();
+      refresh();
+      return loadThumbUrls(templates.map(function (t) { return t.id; }));
+    }).then(function () {
+      renderTemplates();
     }).catch(function (e) {
-      templateList.textContent = 'Failed: ' + e.message;
-      templateList.className = 'ic-list ic-bad';
+      ctxLine.textContent = 'failed';
+      setStatus(e.message, 'error');
     });
 
     loadIssueModel(filter.issueId, filter.editionId).then(function (model) {
       state.model = model;
-      var taken = Object.keys(model.occupied).map(Number).sort(function (a, b) { return a - b; });
-      freeLine.textContent = model.expectedPages
-        ? model.expectedPages + ' pages expected, ' + taken.length + ' already occupied' +
-          (taken.length ? ' (' + taken.join(', ') + ')' : '')
-        : taken.length + ' pages already occupied';
+      // Seed the page count from the issue's own expectation, unless the user
+      // has already typed something.
+      if (model.expectedPages && !state.pageCountTouched) {
+        pageCount.value = String(model.expectedPages);
+        buildSlots(1, model.expectedPages);
+      }
+      var locked = overlayExisting(model);
+      if (locked) setStatus(locked + ' layout(s) already in this issue are locked.');
+      refresh();
     }).catch(function (e) {
-      freeLine.className = 'ic-bad';
-      freeLine.textContent = 'Could not read issue pages: ' + e.message;
+      setStatus('Could not read the issue\'s pages: ' + e.message, 'error');
     });
 
-    // Step 2 of the build plan: pin down the __classname__ strategy by creating
-    // one throwaway layout on the first free page, through the real client.
-    confirmBtn.addEventListener('click', function () {
-      if (!state.ctx) { notify('Still resolving the brand and issue — try again in a moment.', 'error'); return; }
-      if (!state.templates.length) {
-        notify('No layout templates in ' + state.ctx.publication + ', so there is nothing to create from.', 'error');
-        return;
-      }
-      var template = state.templates[0];
-      var page = 1;
-      while (state.model && state.model.occupied[page]) page++;
-      var slot = {
-        page: page,
-        pageEnd: page + template.pageCount - 1,
-        templateId: template.id,
-        templateName: template.name,
-        name: 'PROTOCOL-CHECK-' + new Date().toISOString().slice(0, 10),
-      };
-      confirmBtn.disabled = true;
-      confirmBtn.textContent = 'Creating…';
-      confirmProtocol(slot, state.ctx).then(function (res) {
-        notify('Protocol confirmed: "' + res.strategy + '" — layout ' + res.layout.Id + ' created on page ' + page + '. Delete it when done.', 'default');
-        confirmBtn.textContent = 'Confirmed: ' + res.strategy;
+    // ── create ──
+    createBtn.addEventListener('click', function () {
+      if (state.busy || !state.ctx) return;
+      var slots = plannedSlots(state.blank);
+      if (!slots.length) return;
+
+      var named = nameSlots(slots, patternInput.value || settings.layoutPattern, state.ctx);
+      state.busy = true;
+      createBtn.disabled = true;
+      setStatus('Creating ' + named.length + ' layout(s)…');
+
+      createLayouts(named, state.ctx).then(function (created) {
+        // CreateLayouts returns Pages: null, so the response cannot confirm the
+        // page plan landed — re-read the issue and check what actually appeared.
+        setStatus('Created ' + created.length + ' layout(s). Verifying pages…');
+        return loadIssueModel(filter.issueId, filter.editionId).then(function (model) {
+          state.model = model;
+          var wanted = {};
+          named.forEach(function (s) { for (var p = s.page; p <= s.pageEnd; p++) wanted[p] = true; });
+          var landed = 0, missing = [];
+          Object.keys(wanted).forEach(function (p) {
+            if (model.occupied[p]) landed++; else missing.push(p);
+          });
+          rebuild();
+          if (missing.length) {
+            setStatus('Created ' + created.length + ', but ' + missing.length +
+              ' planned page(s) are not showing yet: ' + missing.join(', ') +
+              '. Refresh Publication Overview in a moment.', 'error');
+          } else {
+            setStatus('Done — ' + created.length + ' layout(s), ' + landed + ' pages, all in place.', 'ok');
+            notify('Issue Creator: ' + created.length + ' layout(s) created.', 'default');
+          }
+        });
       }).catch(function (e) {
-        notify('Protocol check failed: ' + e.message, 'error');
-        confirmBtn.disabled = false;
-        confirmBtn.textContent = 'Confirm protocol';
+        setStatus('Create failed: ' + e.message, 'error');
+      }).then(function () {
+        state.busy = false;
+        refresh();
       });
+    });
+
+    settings.layoutPattern = patternInput.value;
+    patternInput.addEventListener('change', function () {
+      settings.layoutPattern = patternInput.value;
+      saveSettings(settings);
     });
   }
 
@@ -656,6 +1084,10 @@
     nameSlots: nameSlots,
     open: openPlannerDialog,
     strategy: function () { return strategy; },
+    grid: grid,
+    plannedSlots: plannedSlots,
+    gridCounts: gridCounts,
+    loadThumbUrls: loadThumbUrls,
   };
 
   console.info(TAG + ' v' + VERSION + ' loaded');
