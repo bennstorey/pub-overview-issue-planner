@@ -1,0 +1,196 @@
+  // ─── Saved arrangements ────────────────────────────────────────────────────
+  // Two kinds, both stored *in Studio* so they are visible to everyone rather
+  // than trapped in one person's browser:
+  //
+  //   Issue template — a named, reusable arrangement of templates in a specific
+  //     order, not tied to any issue. `IssueTemplate_<name>` in `_Issue Templates`.
+  //   Plan draft     — work in progress on one specific issue, saved without
+  //     creating anything. `IssuePlan_<issueId>` in `_Issue Plans`, one per
+  //     issue, overwritten on each save.
+  //
+  // The PoC proved this shape server-side (object type `Other`, format
+  // text/plain, contained in a dossier). It uploaded the bytes to the Transfer
+  // Server first; here the JSON rides inline as base64 in the Attachment's
+  // Content, which avoids a second endpoint the browser has never been shown to
+  // accept uploads on.
+
+  var ISSUE_TEMPLATE_DOSSIER = '_Issue Templates';
+  var ISSUE_TEMPLATE_PREFIX = 'IssueTemplate_';
+  var PLAN_DOSSIER = '_Issue Plans';
+  var PLAN_PREFIX = 'IssuePlan_';
+
+  function toBase64(text) {
+    // btoa() is latin-1 only; go via UTF-8 bytes so template names with
+    // accents or dashes survive the round trip.
+    var bytes = new TextEncoder().encode(text);
+    var bin = '';
+    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+  }
+
+  function fromBase64(b64) {
+    var bin = atob(b64);
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder().decode(bytes);
+  }
+
+  function findObjectsByName(publicationId, name, operation) {
+    return callServer('QueryObjects', {
+      Params: [
+        { __classname__: 'QueryParam', Property: 'Type', Operation: '=', Value: 'Other' },
+        { __classname__: 'QueryParam', Property: 'PublicationId', Operation: '=', Value: String(publicationId) },
+        { __classname__: 'QueryParam', Property: 'Name', Operation: operation || '=', Value: name },
+      ],
+      FirstEntry: 1, MaxEntries: 200, Hierarchical: false, Order: [],
+      MinimalProps: ['ID', 'Name', 'Modified', 'Modifier'],
+      RequestProps: null, Areas: ['Workflow'], GetHidden: false,
+    }).then(function (r) {
+      var cols = (r.Columns || []).map(function (c) { return c.Name; });
+      return (r.Rows || []).map(function (row) {
+        var o = {};
+        for (var i = 0; i < cols.length; i++) o[cols[i]] = row[i];
+        return { id: String(o.ID), name: o.Name, modified: o.Modified, modifier: o.Modifier };
+      });
+    });
+  }
+
+  function findOrCreateDossier(name, publicationId, categoryId) {
+    return callServer('QueryObjects', {
+      Params: [
+        { __classname__: 'QueryParam', Property: 'Type', Operation: '=', Value: 'Dossier' },
+        { __classname__: 'QueryParam', Property: 'PublicationId', Operation: '=', Value: String(publicationId) },
+        { __classname__: 'QueryParam', Property: 'Name', Operation: '=', Value: name },
+      ],
+      FirstEntry: 1, MaxEntries: 1, Hierarchical: false, Order: [],
+      MinimalProps: ['ID', 'Name'], RequestProps: null, Areas: ['Workflow'], GetHidden: false,
+    }).then(function (r) {
+      if ((r.Rows || []).length) return String(r.Rows[0][0]);
+      return callServer('CreateObjects', {
+        Lock: false, Messages: null, AutoNaming: false, ReplaceGUIDs: null,
+        Objects: [{
+          __classname__: 'Object',
+          MetaData: {
+            __classname__: 'MetaData',
+            BasicMetaData: {
+              __classname__: 'BasicMetaData',
+              ID: '', Name: name, Type: 'Dossier',
+              Publication: { __classname__: 'Publication', Id: String(publicationId) },
+              Category: { __classname__: 'Category', Id: String(categoryId) },
+            },
+          },
+        }],
+      }).then(function (res) {
+        var obj = (res.Objects || [])[0];
+        if (!obj) throw new Error('Could not create the "' + name + '" dossier');
+        return String(obj.MetaData.BasicMetaData.ID);
+      });
+    });
+  }
+
+  function deleteObjects(ids) {
+    if (!ids.length) return Promise.resolve();
+    return callServer('DeleteObjects', {
+      IDs: ids.map(String), Permanent: true, Params: null, Areas: ['Workflow'],
+    });
+  }
+
+  function saveJsonObject(name, publicationId, categoryId, dossierName, data) {
+    return findOrCreateDossier(dossierName, publicationId, categoryId).then(function (dossierId) {
+      return callServer('CreateObjects', {
+        Lock: false, Messages: null, AutoNaming: false, ReplaceGUIDs: null,
+        Objects: [{
+          __classname__: 'Object',
+          MetaData: {
+            __classname__: 'MetaData',
+            BasicMetaData: {
+              __classname__: 'BasicMetaData',
+              ID: '', Name: name, Type: 'Other',
+              Publication: { __classname__: 'Publication', Id: String(publicationId) },
+              Category: { __classname__: 'Category', Id: String(categoryId) },
+            },
+          },
+          Files: [{
+            __classname__: 'Attachment',
+            Rendition: 'native',
+            Type: 'text/plain',
+            Content: toBase64(JSON.stringify(data, null, 2)),
+          }],
+        }],
+      }).then(function (res) {
+        var obj = (res.Objects || [])[0];
+        if (!obj) throw new Error('Save returned no object');
+        var id = String(obj.MetaData.BasicMetaData.ID);
+        return callServer('CreateObjectRelations', {
+          Relations: [{ __classname__: 'Relation', Parent: String(dossierId), Child: id, Type: 'Contained' }],
+        }).then(function () { return { id: id, name: name }; });
+      });
+    });
+  }
+
+  function loadJsonObject(objectId) {
+    return callServer('GetObjects', {
+      IDs: [String(objectId)], Lock: false, Rendition: 'native', RequestInfo: [],
+      HaveVersions: null, Areas: null, EditionId: null, SupportedContentSources: null,
+    }).then(function (r) {
+      var obj = (r.Objects || [])[0];
+      var files = (obj && obj.Files) || [];
+      for (var i = 0; i < files.length; i++) {
+        if (files[i].Content) return JSON.parse(fromBase64(files[i].Content));
+      }
+      // Some servers hand back a URL rather than inline content.
+      for (var j = 0; j < files.length; j++) {
+        if (files[j].FileUrl) {
+          return fetch(withWwApp(files[j].FileUrl), { credentials: 'same-origin' })
+            .then(function (res) {
+              if (!res.ok) throw new Error('Could not download the saved plan: HTTP ' + res.status);
+              return res.json();
+            });
+        }
+      }
+      throw new Error('Saved object ' + objectId + ' has no readable content');
+    });
+  }
+
+  // ── issue templates (named, reusable, not tied to an issue) ────────────────
+
+  function listIssueTemplates(publicationId) {
+    return findObjectsByName(publicationId, ISSUE_TEMPLATE_PREFIX, 'starts').then(function (rows) {
+      return rows.map(function (r) {
+        return {
+          id: r.id, name: r.name.replace(ISSUE_TEMPLATE_PREFIX, ''),
+          modified: r.modified, modifier: r.modifier,
+        };
+      });
+    });
+  }
+
+  function saveIssueTemplate(publicationId, categoryId, name, config) {
+    var objName = ISSUE_TEMPLATE_PREFIX + name;
+    // Overwrite rather than accumulate duplicates under the same name.
+    return findObjectsByName(publicationId, objName, '=').then(function (existing) {
+      return deleteObjects(existing.map(function (e) { return e.id; }));
+    }).then(function () {
+      return saveJsonObject(objName, publicationId, categoryId, ISSUE_TEMPLATE_DOSSIER, config);
+    });
+  }
+
+  // ── plan drafts (one per issue, no pages created) ─────────────────────────
+
+  function savePlanDraft(publicationId, categoryId, issueId, config) {
+    var objName = PLAN_PREFIX + issueId;
+    return findObjectsByName(publicationId, objName, '=').then(function (existing) {
+      return deleteObjects(existing.map(function (e) { return e.id; }));
+    }).then(function () {
+      return saveJsonObject(objName, publicationId, categoryId, PLAN_DOSSIER, config);
+    });
+  }
+
+  function loadPlanDraft(publicationId, issueId) {
+    return findObjectsByName(publicationId, PLAN_PREFIX + issueId, '=').then(function (rows) {
+      if (!rows.length) return null;
+      return loadJsonObject(rows[0].id).then(function (config) {
+        return { config: config, savedBy: rows[0].modifier, savedAt: rows[0].modified, id: rows[0].id };
+      });
+    });
+  }

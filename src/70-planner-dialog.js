@@ -34,6 +34,14 @@
     '.ic-slot-tpl{font-size:10px;color:#777;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
     '.ic-slot-clear{position:absolute;top:3px;right:3px;width:19px;height:19px;padding:0;line-height:1;',
     '  border-radius:50%;border:1px solid #ccc;background:#fff;cursor:pointer;font-size:12px}',
+    '.ic-slot-include{position:absolute;top:5px;left:5px;margin:0;cursor:pointer}',
+    '.ic-slot.ic-excluded{opacity:.45}',
+    '.ic-slot.ic-excluded .ic-slot-thumb{filter:grayscale(80%)}',
+    '.ic-slot.ic-drop{border-color:#1a73e8;border-style:dashed;background:#e8f0fe}',
+    '.ic-slot[draggable=true]{cursor:grab}',
+    '.ic-sep{border-left:1px solid #ddd;height:16px;display:inline-block}',
+    '.ic-toolbar button{padding:3px 9px;border-radius:3px;border:1px solid #ccc;background:#f6f6f6;cursor:pointer;font-size:12px}',
+    '.ic-load{max-width:260px;padding:3px 6px;border:1px solid #ccc;border-radius:3px;font-size:12px}',
     '.ic-right{width:280px;display:flex;flex-direction:column;min-height:0}',
     '.ic-right h3{margin:0;padding:10px 14px;font-size:12px;font-weight:600;color:#555;border-bottom:1px solid #eee}',
     '.ic-templates{flex:1;overflow-y:auto;padding:6px}',
@@ -82,6 +90,12 @@
     var statusLine = el('div', { class: 'ic-status ic-muted', text: '' });
     var countLine = el('div', { class: 'ic-muted', text: '' });
 
+    var allBtn = el('button', { text: 'All', title: 'Include every page in the next run' });
+    var noneBtn = el('button', { text: 'None', title: 'Exclude every page from the next run' });
+    var savePlanBtn = el('button', { text: 'Save plan', title: 'Save this issue as work in progress, creating nothing' });
+    var saveTplBtn = el('button', { text: 'Save as template…', title: 'Save this arrangement for reuse on other issues' });
+    var loadSelect = el('select', { class: 'ic-load', title: 'Load a saved arrangement' });
+
     var closeBtn = el('button', { text: 'Close' });
     var createBtn = el('button', { class: 'ic-primary', text: 'Create pages' });
     createBtn.disabled = true;
@@ -92,7 +106,12 @@
         el('div', { class: 'ic-left' }, [
           el('div', { class: 'ic-toolbar' }, [
             el('span', { class: 'ic-muted', text: 'Pages' }), pageCount, rebuildBtn,
-            el('span', { class: 'ic-muted', text: 'Name' }), patternInput,
+            el('span', { class: 'ic-sep' }), el('span', { class: 'ic-muted', text: 'Select' }), allBtn, noneBtn,
+            el('span', { class: 'ic-sep' }), el('span', { class: 'ic-muted', text: 'Name' }), patternInput,
+          ]),
+          el('div', { class: 'ic-toolbar' }, [
+            savePlanBtn, saveTplBtn,
+            el('span', { class: 'ic-sep' }), el('span', { class: 'ic-muted', text: 'Load' }), loadSelect,
           ]),
           gridBox,
         ]),
@@ -122,11 +141,16 @@
       var willCreate = plannedSlots(state.blank).length;
       countLine.textContent = c.assigned + ' assigned · ' + c.empty + ' empty · ' +
         c.existing + ' already in issue' +
+        (c.excluded ? ' · ' + c.excluded + ' deselected' : '') +
         (state.blank ? ' · empty pages get "' + state.blank.name + '"' : ' · empty pages skipped');
       createBtn.textContent = willCreate ? 'Create ' + willCreate + ' page' + (willCreate === 1 ? '' : 's') : 'Create pages';
       createBtn.disabled = state.busy || !willCreate || !state.ctx;
     }
     grid.onChange = refresh;
+    grid.onError = function (msg) { setStatus(msg, 'error'); };
+
+    allBtn.addEventListener('click', function () { setAllIncluded(true); refresh(); });
+    noneBtn.addEventListener('click', function () { setAllIncluded(false); refresh(); });
 
     function rebuild() {
       var n = Math.max(1, Math.min(999, Number(pageCount.value) || 1));
@@ -177,6 +201,105 @@
       });
     }
 
+    // ── saving and loading arrangements ──
+
+    function arrangementPayload() {
+      var a = serializeArrangement();
+      a.layoutPattern = patternInput.value;
+      a.blankTemplateId = state.blank ? state.blank.id : null;
+      a.savedAt = new Date().toISOString();
+      return a;
+    }
+
+    function refreshLoadList() {
+      if (!state.ctx) return Promise.resolve();
+      return Promise.all([
+        listIssueTemplates(state.ctx.publicationId).catch(function () { return []; }),
+        loadPlanDraft(state.ctx.publicationId, filter.issueId).catch(function () { return null; }),
+      ]).then(function (r) {
+        state.savedTemplates = r[0];
+        state.draft = r[1];
+        loadSelect.textContent = '';
+        loadSelect.appendChild(el('option', { value: '', text: '— load —' }));
+        if (state.draft) {
+          loadSelect.appendChild(el('option', {
+            value: 'draft',
+            text: 'Saved plan for this issue (' + (state.draft.savedBy || '?') + ', ' +
+              String(state.draft.savedAt || '').slice(0, 16).replace('T', ' ') + ')',
+          }));
+        }
+        state.savedTemplates.forEach(function (t) {
+          loadSelect.appendChild(el('option', { value: 'tpl:' + t.id, text: 'Template: ' + t.name }));
+        });
+      });
+    }
+
+    savePlanBtn.addEventListener('click', function () {
+      if (!state.ctx || state.busy) return;
+      state.busy = true;
+      setStatus('Saving plan…');
+      savePlanDraft(state.ctx.publicationId, state.ctx.sectionId, filter.issueId, arrangementPayload())
+        .then(function () {
+          setStatus('Plan saved for ' + state.ctx.issue + '. Nothing was created.', 'ok');
+          return refreshLoadList();
+        })
+        .catch(function (e) { setStatus('Could not save the plan: ' + e.message, 'error'); })
+        .then(function () { state.busy = false; refresh(); });
+    });
+
+    saveTplBtn.addEventListener('click', function () {
+      if (!state.ctx || state.busy) return;
+      var name = window.prompt('Name this arrangement so it can be reused on other issues:', '');
+      if (!name) return;
+      state.busy = true;
+      setStatus('Saving template…');
+      saveIssueTemplate(state.ctx.publicationId, state.ctx.sectionId, name, arrangementPayload())
+        .then(function () {
+          setStatus('Saved as template "' + name + '".', 'ok');
+          return refreshLoadList();
+        })
+        .catch(function (e) { setStatus('Could not save the template: ' + e.message, 'error'); })
+        .then(function () { state.busy = false; refresh(); });
+    });
+
+    loadSelect.addEventListener('change', function () {
+      var v = loadSelect.value;
+      if (!v) return;
+      loadSelect.value = '';
+
+      function apply(arrangement, byOrder, label) {
+        if (arrangement.pageCount && arrangement.pageCount > grid.slots.length) {
+          pageCount.value = String(arrangement.pageCount);
+          state.pageCountTouched = true;
+          buildSlots(1, arrangement.pageCount);
+          if (state.model) overlayExisting(state.model);
+        }
+        if (arrangement.layoutPattern) patternInput.value = arrangement.layoutPattern;
+        var res = applyArrangement(arrangement, { byOrder: byOrder });
+        refresh();
+        setStatus(res.skipped.length
+          ? 'Loaded ' + label + ' — ' + res.applied + ' placed, ' + res.skipped.length +
+            ' skipped (already in the issue, or no room): ' + res.skipped.join(', ')
+          : 'Loaded ' + label + ' — ' + res.applied + ' placed. Nothing created yet.',
+          res.skipped.length ? 'error' : 'ok');
+      }
+
+      if (v === 'draft' && state.draft) {
+        apply(state.draft.config, false, 'the saved plan');
+        return;
+      }
+      var id = v.replace(/^tpl:/, '');
+      state.busy = true;
+      setStatus('Loading template…');
+      loadJsonObject(id).then(function (cfg) {
+        // An issue template is an ordered sequence, so lay it out from the first
+        // free page rather than at the page numbers it happened to be saved at.
+        apply(cfg, true, 'the template');
+      }).catch(function (e) {
+        setStatus('Could not load: ' + e.message, 'error');
+      }).then(function () { state.busy = false; refresh(); });
+    });
+
     // ── load ──
     buildSlots(1, Number(pageCount.value) || 16);
     refresh();
@@ -202,6 +325,14 @@
     }).then(function () {
       renderTemplates();
       refresh();
+      // Offer saved arrangements only once templates are known, so loading one
+      // has something to resolve template names against.
+      return refreshLoadList();
+    }).then(function () {
+      if (state.draft) {
+        setStatus('A saved plan exists for this issue (' + (state.draft.savedBy || '?') +
+          '). Pick it under Load to restore it.');
+      }
     }).catch(function (e) {
       ctxLine.textContent = 'failed';
       setStatus(e.message, 'error');

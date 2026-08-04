@@ -105,11 +105,16 @@
       // rather than choosing silently.
       var cats = found.pub.Categories || [];
       var sectionName = '';
+      var sectionId = '';
       var defaulted = false;
       for (var k = 0; k < cats.length; k++) {
-        if (String(cats[k].Id) === String(filter.categoryId)) { sectionName = cats[k].Name; break; }
+        if (String(cats[k].Id) === String(filter.categoryId)) {
+          sectionName = cats[k].Name; sectionId = String(cats[k].Id); break;
+        }
       }
-      if (!sectionName && cats.length) { sectionName = cats[0].Name; defaulted = true; }
+      if (!sectionName && cats.length) {
+        sectionName = cats[0].Name; sectionId = String(cats[0].Id); defaulted = true;
+      }
 
       return {
         publication: found.pub.Name,
@@ -119,6 +124,10 @@
         pubChannel: found.channel.Name,
         pubChannelId: String(found.channel.Id),
         section: sectionName,
+        // Where the saved plans and issue templates get filed. Not the same
+        // question as which category a created layout belongs to — that comes
+        // from each layout's own template.
+        sectionId: sectionId,
         sectionDefaulted: defaulted,
         categories: cats.map(function (c) { return { id: String(c.Id), name: c.Name }; }),
       };

@@ -35,6 +35,14 @@
     plannedSlots: plannedSlots,
     gridCounts: gridCounts,
     loadThumbUrls: loadThumbUrls,
+    moveAssignment: moveAssignment,
+    serializeArrangement: serializeArrangement,
+    applyArrangement: applyArrangement,
+    setAllIncluded: setAllIncluded,
+    listIssueTemplates: listIssueTemplates,
+    saveIssueTemplate: saveIssueTemplate,
+    savePlanDraft: savePlanDraft,
+    loadPlanDraft: loadPlanDraft,
   };
 
   console.info(TAG + ' v' + VERSION + ' loaded');

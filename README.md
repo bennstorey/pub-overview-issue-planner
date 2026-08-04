@@ -23,11 +23,26 @@ Open **Create pages…** in the Publication Overview triple-dot menu:
   rendition is only its first spread, so a 4-page template would otherwise look like 2
   pages; `RequestInfo: ['Pages']` returns a thumb per page instead
 - Each layout takes its category from its own template, not from the page grid's filter
-- **Create** sends the whole plan in one `CreateLayouts` call, then re-reads the issue to
-  verify the pages actually landed
+- **Drag a page onto another** to rearrange the plan. Spreads move whole, and a move that
+  would land on a page already in the issue is refused
+- **Tick or untick pages** to create only some of them. Everything is included by default,
+  so a partial run is a deliberate act; `All` / `None` for the common cases
+- **Save plan** stores work in progress on this issue without creating anything —
+  one draft per issue, and reopening the issue offers to restore it
+- **Save as template…** stores a named, reusable arrangement not tied to any issue.
+  Loading one lays its sequence out from the first free page, so it fits around pages that
+  already exist rather than colliding with them
+- **Create** sends the selected pages in one `CreateLayouts` call, then re-reads the issue
+  to verify they actually landed
 
-Still to build: saved issue templates and reusable plan drafts, per-slot category and
-edition overrides, and a page-range/section view for very large issues.
+Still to build: per-slot category and edition overrides, and a page-range view for very
+large issues.
+
+**Not supported: moving pages that already exist in the issue.** The grid rearranges a
+*plan*; a created layout is anchored to its real page numbers, and shifting those means
+repaging live production content. The Planning API's `ModifyLayouts` could do it, but it
+is a different and more dangerous operation than editing a plan, so it is deliberately out
+of scope here.
 
 ## Build
 
@@ -144,6 +159,28 @@ category of its own.
 **The response cannot confirm the page plan.** Its `Layouts` carry `Id`, `Name` and the
 resolved `Publication` / `Issue` / `PubChannel` / `Section` / `Status`, but `Pages` comes
 back `null`. Verify with `loadIssueModel()` or by reading `PlannedPageRange`.
+
+## Saved arrangements
+
+Both kinds live **in Studio**, so they are visible to everyone rather than trapped in one
+person's browser. Object type `Other`, format `text/plain`, contained in a dossier:
+
+| | Object | Dossier |
+|---|---|---|
+| Plan draft — work in progress on one issue | `IssuePlan_<issueId>` | `_Issue Plans` |
+| Issue template — named, reusable, not tied to an issue | `IssueTemplate_<name>` | `_Issue Templates` |
+
+Both are overwritten on save rather than accumulating duplicates. Neither stores existing
+pages: those belong to the issue, not the plan, and are re-read fresh every time. When a
+saved arrangement is restored, entries whose pages have been created in the meantime are
+skipped and reported rather than silently dropped.
+
+⚠️ **The storage write path is not yet verified against the server.** The PoC proved this
+object shape works, but it uploaded the bytes to the Transfer Server first; here the JSON
+rides inline as base64 in the Attachment's `Content`, which avoids an endpoint the browser
+has never been shown to accept uploads on. `Content` is a documented field on `Attachment`,
+but if the server rejects it, the fallback is the Transfer Server route the PoC used —
+`loadJsonObject` already handles a `FileUrl` coming back instead of inline content.
 
 ## Notes
 

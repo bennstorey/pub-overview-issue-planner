@@ -21,7 +21,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '0.3.0';
+  var VERSION = '0.4.0';
   var TAG = '[issue-creator]';
 
   if (typeof PoUiSdk === 'undefined') {

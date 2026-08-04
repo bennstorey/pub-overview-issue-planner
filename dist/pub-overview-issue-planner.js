@@ -21,7 +21,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '0.3.0';
+  var VERSION = '0.4.0';
   var TAG = '[issue-creator]';
 
   if (typeof PoUiSdk === 'undefined') {
@@ -362,11 +362,16 @@
       // rather than choosing silently.
       var cats = found.pub.Categories || [];
       var sectionName = '';
+      var sectionId = '';
       var defaulted = false;
       for (var k = 0; k < cats.length; k++) {
-        if (String(cats[k].Id) === String(filter.categoryId)) { sectionName = cats[k].Name; break; }
+        if (String(cats[k].Id) === String(filter.categoryId)) {
+          sectionName = cats[k].Name; sectionId = String(cats[k].Id); break;
+        }
       }
-      if (!sectionName && cats.length) { sectionName = cats[0].Name; defaulted = true; }
+      if (!sectionName && cats.length) {
+        sectionName = cats[0].Name; sectionId = String(cats[0].Id); defaulted = true;
+      }
 
       return {
         publication: found.pub.Name,
@@ -376,9 +381,210 @@
         pubChannel: found.channel.Name,
         pubChannelId: String(found.channel.Id),
         section: sectionName,
+        // Where the saved plans and issue templates get filed. Not the same
+        // question as which category a created layout belongs to — that comes
+        // from each layout's own template.
+        sectionId: sectionId,
         sectionDefaulted: defaulted,
         categories: cats.map(function (c) { return { id: String(c.Id), name: c.Name }; }),
       };
+    });
+  }
+
+  // ─── Saved arrangements ────────────────────────────────────────────────────
+  // Two kinds, both stored *in Studio* so they are visible to everyone rather
+  // than trapped in one person's browser:
+  //
+  //   Issue template — a named, reusable arrangement of templates in a specific
+  //     order, not tied to any issue. `IssueTemplate_<name>` in `_Issue Templates`.
+  //   Plan draft     — work in progress on one specific issue, saved without
+  //     creating anything. `IssuePlan_<issueId>` in `_Issue Plans`, one per
+  //     issue, overwritten on each save.
+  //
+  // The PoC proved this shape server-side (object type `Other`, format
+  // text/plain, contained in a dossier). It uploaded the bytes to the Transfer
+  // Server first; here the JSON rides inline as base64 in the Attachment's
+  // Content, which avoids a second endpoint the browser has never been shown to
+  // accept uploads on.
+
+  var ISSUE_TEMPLATE_DOSSIER = '_Issue Templates';
+  var ISSUE_TEMPLATE_PREFIX = 'IssueTemplate_';
+  var PLAN_DOSSIER = '_Issue Plans';
+  var PLAN_PREFIX = 'IssuePlan_';
+
+  function toBase64(text) {
+    // btoa() is latin-1 only; go via UTF-8 bytes so template names with
+    // accents or dashes survive the round trip.
+    var bytes = new TextEncoder().encode(text);
+    var bin = '';
+    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+  }
+
+  function fromBase64(b64) {
+    var bin = atob(b64);
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder().decode(bytes);
+  }
+
+  function findObjectsByName(publicationId, name, operation) {
+    return callServer('QueryObjects', {
+      Params: [
+        { __classname__: 'QueryParam', Property: 'Type', Operation: '=', Value: 'Other' },
+        { __classname__: 'QueryParam', Property: 'PublicationId', Operation: '=', Value: String(publicationId) },
+        { __classname__: 'QueryParam', Property: 'Name', Operation: operation || '=', Value: name },
+      ],
+      FirstEntry: 1, MaxEntries: 200, Hierarchical: false, Order: [],
+      MinimalProps: ['ID', 'Name', 'Modified', 'Modifier'],
+      RequestProps: null, Areas: ['Workflow'], GetHidden: false,
+    }).then(function (r) {
+      var cols = (r.Columns || []).map(function (c) { return c.Name; });
+      return (r.Rows || []).map(function (row) {
+        var o = {};
+        for (var i = 0; i < cols.length; i++) o[cols[i]] = row[i];
+        return { id: String(o.ID), name: o.Name, modified: o.Modified, modifier: o.Modifier };
+      });
+    });
+  }
+
+  function findOrCreateDossier(name, publicationId, categoryId) {
+    return callServer('QueryObjects', {
+      Params: [
+        { __classname__: 'QueryParam', Property: 'Type', Operation: '=', Value: 'Dossier' },
+        { __classname__: 'QueryParam', Property: 'PublicationId', Operation: '=', Value: String(publicationId) },
+        { __classname__: 'QueryParam', Property: 'Name', Operation: '=', Value: name },
+      ],
+      FirstEntry: 1, MaxEntries: 1, Hierarchical: false, Order: [],
+      MinimalProps: ['ID', 'Name'], RequestProps: null, Areas: ['Workflow'], GetHidden: false,
+    }).then(function (r) {
+      if ((r.Rows || []).length) return String(r.Rows[0][0]);
+      return callServer('CreateObjects', {
+        Lock: false, Messages: null, AutoNaming: false, ReplaceGUIDs: null,
+        Objects: [{
+          __classname__: 'Object',
+          MetaData: {
+            __classname__: 'MetaData',
+            BasicMetaData: {
+              __classname__: 'BasicMetaData',
+              ID: '', Name: name, Type: 'Dossier',
+              Publication: { __classname__: 'Publication', Id: String(publicationId) },
+              Category: { __classname__: 'Category', Id: String(categoryId) },
+            },
+          },
+        }],
+      }).then(function (res) {
+        var obj = (res.Objects || [])[0];
+        if (!obj) throw new Error('Could not create the "' + name + '" dossier');
+        return String(obj.MetaData.BasicMetaData.ID);
+      });
+    });
+  }
+
+  function deleteObjects(ids) {
+    if (!ids.length) return Promise.resolve();
+    return callServer('DeleteObjects', {
+      IDs: ids.map(String), Permanent: true, Params: null, Areas: ['Workflow'],
+    });
+  }
+
+  function saveJsonObject(name, publicationId, categoryId, dossierName, data) {
+    return findOrCreateDossier(dossierName, publicationId, categoryId).then(function (dossierId) {
+      return callServer('CreateObjects', {
+        Lock: false, Messages: null, AutoNaming: false, ReplaceGUIDs: null,
+        Objects: [{
+          __classname__: 'Object',
+          MetaData: {
+            __classname__: 'MetaData',
+            BasicMetaData: {
+              __classname__: 'BasicMetaData',
+              ID: '', Name: name, Type: 'Other',
+              Publication: { __classname__: 'Publication', Id: String(publicationId) },
+              Category: { __classname__: 'Category', Id: String(categoryId) },
+            },
+          },
+          Files: [{
+            __classname__: 'Attachment',
+            Rendition: 'native',
+            Type: 'text/plain',
+            Content: toBase64(JSON.stringify(data, null, 2)),
+          }],
+        }],
+      }).then(function (res) {
+        var obj = (res.Objects || [])[0];
+        if (!obj) throw new Error('Save returned no object');
+        var id = String(obj.MetaData.BasicMetaData.ID);
+        return callServer('CreateObjectRelations', {
+          Relations: [{ __classname__: 'Relation', Parent: String(dossierId), Child: id, Type: 'Contained' }],
+        }).then(function () { return { id: id, name: name }; });
+      });
+    });
+  }
+
+  function loadJsonObject(objectId) {
+    return callServer('GetObjects', {
+      IDs: [String(objectId)], Lock: false, Rendition: 'native', RequestInfo: [],
+      HaveVersions: null, Areas: null, EditionId: null, SupportedContentSources: null,
+    }).then(function (r) {
+      var obj = (r.Objects || [])[0];
+      var files = (obj && obj.Files) || [];
+      for (var i = 0; i < files.length; i++) {
+        if (files[i].Content) return JSON.parse(fromBase64(files[i].Content));
+      }
+      // Some servers hand back a URL rather than inline content.
+      for (var j = 0; j < files.length; j++) {
+        if (files[j].FileUrl) {
+          return fetch(withWwApp(files[j].FileUrl), { credentials: 'same-origin' })
+            .then(function (res) {
+              if (!res.ok) throw new Error('Could not download the saved plan: HTTP ' + res.status);
+              return res.json();
+            });
+        }
+      }
+      throw new Error('Saved object ' + objectId + ' has no readable content');
+    });
+  }
+
+  // ── issue templates (named, reusable, not tied to an issue) ────────────────
+
+  function listIssueTemplates(publicationId) {
+    return findObjectsByName(publicationId, ISSUE_TEMPLATE_PREFIX, 'starts').then(function (rows) {
+      return rows.map(function (r) {
+        return {
+          id: r.id, name: r.name.replace(ISSUE_TEMPLATE_PREFIX, ''),
+          modified: r.modified, modifier: r.modifier,
+        };
+      });
+    });
+  }
+
+  function saveIssueTemplate(publicationId, categoryId, name, config) {
+    var objName = ISSUE_TEMPLATE_PREFIX + name;
+    // Overwrite rather than accumulate duplicates under the same name.
+    return findObjectsByName(publicationId, objName, '=').then(function (existing) {
+      return deleteObjects(existing.map(function (e) { return e.id; }));
+    }).then(function () {
+      return saveJsonObject(objName, publicationId, categoryId, ISSUE_TEMPLATE_DOSSIER, config);
+    });
+  }
+
+  // ── plan drafts (one per issue, no pages created) ─────────────────────────
+
+  function savePlanDraft(publicationId, categoryId, issueId, config) {
+    var objName = PLAN_PREFIX + issueId;
+    return findObjectsByName(publicationId, objName, '=').then(function (existing) {
+      return deleteObjects(existing.map(function (e) { return e.id; }));
+    }).then(function () {
+      return saveJsonObject(objName, publicationId, categoryId, PLAN_DOSSIER, config);
+    });
+  }
+
+  function loadPlanDraft(publicationId, issueId) {
+    return findObjectsByName(publicationId, PLAN_PREFIX + issueId, '=').then(function (rows) {
+      if (!rows.length) return null;
+      return loadJsonObject(rows[0].id).then(function (config) {
+        return { config: config, savedBy: rows[0].modifier, savedAt: rows[0].modified, id: rows[0].id };
+      });
     });
   }
 
@@ -621,7 +827,10 @@
   function buildSlots(firstPage, count) {
     grid.slots = [];
     for (var i = 0; i < count; i++) {
-      grid.slots.push({ page: firstPage + i, templateId: null, templateName: null, span: 1, covered: false });
+      grid.slots.push({
+        page: firstPage + i, templateId: null, templateName: null,
+        span: 1, covered: false, include: true,
+      });
     }
     grid.selected = null;
   }
@@ -747,8 +956,9 @@
     return null;
   }
 
-  // The slots a create run should act on: assigned, not covered, not existing.
-  // Empty slots are included only when a blank template is configured.
+  // The slots a create run should act on: assigned, not covered, not existing,
+  // and not deselected. Empty slots are included only when a blank template is
+  // configured — and only if they are selected.
   //
   // `section` is the template's own category — a layout made from the News
   // template belongs in News, regardless of what the page grid is filtered to.
@@ -758,6 +968,7 @@
     for (var i = 0; i < grid.slots.length; i++) {
       var s = grid.slots[i];
       if (s.covered || s.existing) continue;
+      if (s.include === false) continue;
       if (s.templateId) {
         out.push({
           page: s.page, pageEnd: s.page + (s.span || 1) - 1,
@@ -775,16 +986,151 @@
     return out;
   }
 
+  // ── Selecting which pages to create ───────────────────────────────────────
+  // A slot is included unless explicitly turned off, so the default stays
+  // "create everything planned" and partial runs are a deliberate act.
+
+  function setIncluded(i, on) {
+    var o = ownerIndex(i);
+    grid.slots[o].include = !!on;
+  }
+
+  function setAllIncluded(on) {
+    for (var i = 0; i < grid.slots.length; i++) {
+      if (!grid.slots[i].covered && !grid.slots[i].existing) grid.slots[i].include = !!on;
+    }
+  }
+
+  // ── Reordering ────────────────────────────────────────────────────────────
+  // Moves an assignment from one page to another, so a plan can be rearranged
+  // without re-picking templates. Only unrealised slots move: pages that exist
+  // in the issue are anchored to their real page numbers, and changing those
+  // means repaging live production content, not editing a plan.
+
+  function moveAssignment(fromIndex, toIndex) {
+    var from = ownerIndex(fromIndex);
+    var to = ownerIndex(toIndex);
+    if (from === to) return null;
+
+    var src = grid.slots[from];
+    if (src.existing) return 'Pages already in the issue cannot be moved from here.';
+    if (!src.templateId) return 'That page has nothing on it to move.';
+
+    var span = src.span || 1;
+    var dest = grid.slots[to];
+    if (dest.existing) return 'p' + pad3(dest.page) + ' is already in the issue.';
+    if (to + span > grid.slots.length) {
+      return 'A ' + span + '-page item does not fit at p' + pad3(dest.page) + '.';
+    }
+    // The destination must be clear of locked pages across the whole span —
+    // ignoring the source itself, which is about to be vacated.
+    for (var j = to; j < to + span; j++) {
+      if (j >= from && j < from + span) continue;
+      var owner = grid.slots[j].covered ? grid.slots[ownerIndex(j)] : grid.slots[j];
+      if (owner.existing) {
+        return 'Moving there would overlap p' + pad3(grid.slots[j].page) +
+          ', already in this issue ("' + owner.existing.name + '").';
+      }
+    }
+
+    var payload = {
+      templateId: src.templateId, templateName: src.templateName,
+      templateCategory: src.templateCategory || '', span: span,
+      include: src.include !== false,
+    };
+
+    clearSlotSpan(from);
+    // Clear whatever is at the destination, then write the moved item in.
+    for (var k = to; k < to + span; k++) {
+      if (grid.slots[k].templateId || grid.slots[k].covered) clearSlotSpan(k);
+    }
+    grid.slots[to] = {
+      page: grid.slots[to].page, templateId: payload.templateId, templateName: payload.templateName,
+      templateCategory: payload.templateCategory, span: payload.span, covered: false,
+      include: payload.include,
+    };
+    for (var m = to + 1; m < to + span; m++) {
+      grid.slots[m] = { page: grid.slots[m].page, templateId: null, templateName: null, span: 1, covered: true };
+    }
+    grid.selected = to;
+    return null;
+  }
+
+  // ── Serialising an arrangement ────────────────────────────────────────────
+  // Only the assignments; existing pages are never stored, since they belong to
+  // the issue rather than to the plan and are re-read fresh every time.
+
+  function serializeArrangement() {
+    var items = [];
+    for (var i = 0; i < grid.slots.length; i++) {
+      var s = grid.slots[i];
+      if (s.covered || s.existing || !s.templateId) continue;
+      items.push({
+        page: s.page, span: s.span || 1,
+        templateId: s.templateId, templateName: s.templateName,
+        templateCategory: s.templateCategory || '',
+        include: s.include !== false,
+      });
+    }
+    return { pageCount: grid.slots.length, items: items };
+  }
+
+  // Applies a saved arrangement over the current grid. Existing pages always
+  // win: an entry whose pages have been created since the save is skipped and
+  // reported, rather than silently dropped or overwriting live content.
+  function applyArrangement(arrangement, options) {
+    options = options || {};
+    var items = (arrangement && arrangement.items) || [];
+    var offset = options.byOrder ? null : 0; // byOrder ignores stored page numbers
+    var skipped = [];
+    var applied = 0;
+
+    if (options.byOrder) {
+      // Issue templates are an ordered sequence, so lay them from the first
+      // free page rather than at whatever page numbers they were saved at.
+      var cursor = 0;
+      for (var n = 0; n < items.length; n++) {
+        var it = items[n];
+        while (cursor < grid.slots.length &&
+               (grid.slots[cursor].covered || grid.slots[cursor].existing)) cursor++;
+        if (cursor >= grid.slots.length) { skipped.push(it.templateName); continue; }
+        grid.selected = cursor;
+        var err = assignTemplate({
+          id: it.templateId, name: it.templateName,
+          pageCount: it.span, category: it.templateCategory,
+        });
+        if (err) skipped.push(it.templateName);
+        else { grid.slots[cursor].include = it.include !== false; applied++; }
+        cursor += it.span;
+      }
+    } else {
+      for (var i = 0; i < items.length; i++) {
+        var item = items[i];
+        var idx = slotAt(item.page + offset);
+        if (idx < 0) { skipped.push('p' + pad3(item.page)); continue; }
+        grid.selected = idx;
+        var e = assignTemplate({
+          id: item.templateId, name: item.templateName,
+          pageCount: item.span, category: item.templateCategory,
+        });
+        if (e) skipped.push('p' + pad3(item.page));
+        else { grid.slots[idx].include = item.include !== false; applied++; }
+      }
+    }
+    grid.selected = null;
+    return { applied: applied, skipped: skipped };
+  }
+
   function gridCounts() {
-    var assigned = 0, empty = 0, existing = 0;
+    var assigned = 0, empty = 0, existing = 0, excluded = 0;
     for (var i = 0; i < grid.slots.length; i++) {
       var s = grid.slots[i];
       if (s.covered) continue;
-      if (s.existing) existing++;
-      else if (s.templateId) assigned++;
-      else empty++;
+      if (s.existing) { existing++; continue; }
+      if (s.include === false) excluded++;
+      if (s.templateId) assigned++; else empty++;
     }
-    return { assigned: assigned, empty: empty, existing: existing };
+    return { assigned: assigned, empty: empty, existing: existing, excluded: excluded };
   }
 
   // ─── Rendering ─────────────────────────────────────────────────────────────
@@ -802,9 +1148,36 @@
       if (grid.selected === i) classes += ' ic-selected';
       if (slot.templateId) classes += ' ic-filled';
       if (slot.existing) classes += ' ic-existing';
+      if (!slot.existing && slot.include === false) classes += ' ic-excluded';
 
       var node = el('div', { class: classes });
       if (span > 1) node.style.gridColumn = 'span ' + span;
+
+      // Drag to rearrange the plan. Only assigned, unrealised slots move.
+      if (slot.templateId && !slot.existing) {
+        node.setAttribute('draggable', 'true');
+        node.addEventListener('dragstart', function (ev) {
+          ev.dataTransfer.effectAllowed = 'move';
+          ev.dataTransfer.setData('text/plain', String(i));
+        });
+      }
+      if (!slot.existing) {
+        node.addEventListener('dragover', function (ev) {
+          ev.preventDefault();
+          ev.dataTransfer.dropEffect = 'move';
+          node.classList.add('ic-drop');
+        });
+        node.addEventListener('dragleave', function () { node.classList.remove('ic-drop'); });
+        node.addEventListener('drop', function (ev) {
+          ev.preventDefault();
+          node.classList.remove('ic-drop');
+          var from = Number(ev.dataTransfer.getData('text/plain'));
+          if (isNaN(from)) return;
+          var err = moveAssignment(from, i);
+          if (err && grid.onError) grid.onError(err);
+          if (grid.onChange) grid.onChange();
+        });
+      }
 
       var thumbId = slot.existing ? slot.existing.id : slot.templateId;
       var thumbBox = el('div', { class: 'ic-slot-thumb' });
@@ -853,6 +1226,18 @@
           if (grid.onChange) grid.onChange();
         });
         node.appendChild(clear);
+      }
+
+      // Include/exclude this page from the next create run.
+      if (!slot.existing) {
+        var box = el('input', { type: 'checkbox', class: 'ic-slot-include', title: 'Include in the next create run' });
+        box.checked = slot.include !== false;
+        box.addEventListener('click', function (ev) { ev.stopPropagation(); });
+        box.addEventListener('change', function () {
+          setIncluded(i, box.checked);
+          if (grid.onChange) grid.onChange();
+        });
+        node.appendChild(box);
       }
 
       if (!slot.existing) {
@@ -917,6 +1302,14 @@
     '.ic-slot-tpl{font-size:10px;color:#777;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
     '.ic-slot-clear{position:absolute;top:3px;right:3px;width:19px;height:19px;padding:0;line-height:1;',
     '  border-radius:50%;border:1px solid #ccc;background:#fff;cursor:pointer;font-size:12px}',
+    '.ic-slot-include{position:absolute;top:5px;left:5px;margin:0;cursor:pointer}',
+    '.ic-slot.ic-excluded{opacity:.45}',
+    '.ic-slot.ic-excluded .ic-slot-thumb{filter:grayscale(80%)}',
+    '.ic-slot.ic-drop{border-color:#1a73e8;border-style:dashed;background:#e8f0fe}',
+    '.ic-slot[draggable=true]{cursor:grab}',
+    '.ic-sep{border-left:1px solid #ddd;height:16px;display:inline-block}',
+    '.ic-toolbar button{padding:3px 9px;border-radius:3px;border:1px solid #ccc;background:#f6f6f6;cursor:pointer;font-size:12px}',
+    '.ic-load{max-width:260px;padding:3px 6px;border:1px solid #ccc;border-radius:3px;font-size:12px}',
     '.ic-right{width:280px;display:flex;flex-direction:column;min-height:0}',
     '.ic-right h3{margin:0;padding:10px 14px;font-size:12px;font-weight:600;color:#555;border-bottom:1px solid #eee}',
     '.ic-templates{flex:1;overflow-y:auto;padding:6px}',
@@ -965,6 +1358,12 @@
     var statusLine = el('div', { class: 'ic-status ic-muted', text: '' });
     var countLine = el('div', { class: 'ic-muted', text: '' });
 
+    var allBtn = el('button', { text: 'All', title: 'Include every page in the next run' });
+    var noneBtn = el('button', { text: 'None', title: 'Exclude every page from the next run' });
+    var savePlanBtn = el('button', { text: 'Save plan', title: 'Save this issue as work in progress, creating nothing' });
+    var saveTplBtn = el('button', { text: 'Save as template…', title: 'Save this arrangement for reuse on other issues' });
+    var loadSelect = el('select', { class: 'ic-load', title: 'Load a saved arrangement' });
+
     var closeBtn = el('button', { text: 'Close' });
     var createBtn = el('button', { class: 'ic-primary', text: 'Create pages' });
     createBtn.disabled = true;
@@ -975,7 +1374,12 @@
         el('div', { class: 'ic-left' }, [
           el('div', { class: 'ic-toolbar' }, [
             el('span', { class: 'ic-muted', text: 'Pages' }), pageCount, rebuildBtn,
-            el('span', { class: 'ic-muted', text: 'Name' }), patternInput,
+            el('span', { class: 'ic-sep' }), el('span', { class: 'ic-muted', text: 'Select' }), allBtn, noneBtn,
+            el('span', { class: 'ic-sep' }), el('span', { class: 'ic-muted', text: 'Name' }), patternInput,
+          ]),
+          el('div', { class: 'ic-toolbar' }, [
+            savePlanBtn, saveTplBtn,
+            el('span', { class: 'ic-sep' }), el('span', { class: 'ic-muted', text: 'Load' }), loadSelect,
           ]),
           gridBox,
         ]),
@@ -1005,11 +1409,16 @@
       var willCreate = plannedSlots(state.blank).length;
       countLine.textContent = c.assigned + ' assigned · ' + c.empty + ' empty · ' +
         c.existing + ' already in issue' +
+        (c.excluded ? ' · ' + c.excluded + ' deselected' : '') +
         (state.blank ? ' · empty pages get "' + state.blank.name + '"' : ' · empty pages skipped');
       createBtn.textContent = willCreate ? 'Create ' + willCreate + ' page' + (willCreate === 1 ? '' : 's') : 'Create pages';
       createBtn.disabled = state.busy || !willCreate || !state.ctx;
     }
     grid.onChange = refresh;
+    grid.onError = function (msg) { setStatus(msg, 'error'); };
+
+    allBtn.addEventListener('click', function () { setAllIncluded(true); refresh(); });
+    noneBtn.addEventListener('click', function () { setAllIncluded(false); refresh(); });
 
     function rebuild() {
       var n = Math.max(1, Math.min(999, Number(pageCount.value) || 1));
@@ -1060,6 +1469,105 @@
       });
     }
 
+    // ── saving and loading arrangements ──
+
+    function arrangementPayload() {
+      var a = serializeArrangement();
+      a.layoutPattern = patternInput.value;
+      a.blankTemplateId = state.blank ? state.blank.id : null;
+      a.savedAt = new Date().toISOString();
+      return a;
+    }
+
+    function refreshLoadList() {
+      if (!state.ctx) return Promise.resolve();
+      return Promise.all([
+        listIssueTemplates(state.ctx.publicationId).catch(function () { return []; }),
+        loadPlanDraft(state.ctx.publicationId, filter.issueId).catch(function () { return null; }),
+      ]).then(function (r) {
+        state.savedTemplates = r[0];
+        state.draft = r[1];
+        loadSelect.textContent = '';
+        loadSelect.appendChild(el('option', { value: '', text: '— load —' }));
+        if (state.draft) {
+          loadSelect.appendChild(el('option', {
+            value: 'draft',
+            text: 'Saved plan for this issue (' + (state.draft.savedBy || '?') + ', ' +
+              String(state.draft.savedAt || '').slice(0, 16).replace('T', ' ') + ')',
+          }));
+        }
+        state.savedTemplates.forEach(function (t) {
+          loadSelect.appendChild(el('option', { value: 'tpl:' + t.id, text: 'Template: ' + t.name }));
+        });
+      });
+    }
+
+    savePlanBtn.addEventListener('click', function () {
+      if (!state.ctx || state.busy) return;
+      state.busy = true;
+      setStatus('Saving plan…');
+      savePlanDraft(state.ctx.publicationId, state.ctx.sectionId, filter.issueId, arrangementPayload())
+        .then(function () {
+          setStatus('Plan saved for ' + state.ctx.issue + '. Nothing was created.', 'ok');
+          return refreshLoadList();
+        })
+        .catch(function (e) { setStatus('Could not save the plan: ' + e.message, 'error'); })
+        .then(function () { state.busy = false; refresh(); });
+    });
+
+    saveTplBtn.addEventListener('click', function () {
+      if (!state.ctx || state.busy) return;
+      var name = window.prompt('Name this arrangement so it can be reused on other issues:', '');
+      if (!name) return;
+      state.busy = true;
+      setStatus('Saving template…');
+      saveIssueTemplate(state.ctx.publicationId, state.ctx.sectionId, name, arrangementPayload())
+        .then(function () {
+          setStatus('Saved as template "' + name + '".', 'ok');
+          return refreshLoadList();
+        })
+        .catch(function (e) { setStatus('Could not save the template: ' + e.message, 'error'); })
+        .then(function () { state.busy = false; refresh(); });
+    });
+
+    loadSelect.addEventListener('change', function () {
+      var v = loadSelect.value;
+      if (!v) return;
+      loadSelect.value = '';
+
+      function apply(arrangement, byOrder, label) {
+        if (arrangement.pageCount && arrangement.pageCount > grid.slots.length) {
+          pageCount.value = String(arrangement.pageCount);
+          state.pageCountTouched = true;
+          buildSlots(1, arrangement.pageCount);
+          if (state.model) overlayExisting(state.model);
+        }
+        if (arrangement.layoutPattern) patternInput.value = arrangement.layoutPattern;
+        var res = applyArrangement(arrangement, { byOrder: byOrder });
+        refresh();
+        setStatus(res.skipped.length
+          ? 'Loaded ' + label + ' — ' + res.applied + ' placed, ' + res.skipped.length +
+            ' skipped (already in the issue, or no room): ' + res.skipped.join(', ')
+          : 'Loaded ' + label + ' — ' + res.applied + ' placed. Nothing created yet.',
+          res.skipped.length ? 'error' : 'ok');
+      }
+
+      if (v === 'draft' && state.draft) {
+        apply(state.draft.config, false, 'the saved plan');
+        return;
+      }
+      var id = v.replace(/^tpl:/, '');
+      state.busy = true;
+      setStatus('Loading template…');
+      loadJsonObject(id).then(function (cfg) {
+        // An issue template is an ordered sequence, so lay it out from the first
+        // free page rather than at the page numbers it happened to be saved at.
+        apply(cfg, true, 'the template');
+      }).catch(function (e) {
+        setStatus('Could not load: ' + e.message, 'error');
+      }).then(function () { state.busy = false; refresh(); });
+    });
+
     // ── load ──
     buildSlots(1, Number(pageCount.value) || 16);
     refresh();
@@ -1085,6 +1593,14 @@
     }).then(function () {
       renderTemplates();
       refresh();
+      // Offer saved arrangements only once templates are known, so loading one
+      // has something to resolve template names against.
+      return refreshLoadList();
+    }).then(function () {
+      if (state.draft) {
+        setStatus('A saved plan exists for this issue (' + (state.draft.savedBy || '?') +
+          '). Pick it under Load to restore it.');
+      }
     }).catch(function (e) {
       ctxLine.textContent = 'failed';
       setStatus(e.message, 'error');
@@ -1190,6 +1706,14 @@
     plannedSlots: plannedSlots,
     gridCounts: gridCounts,
     loadThumbUrls: loadThumbUrls,
+    moveAssignment: moveAssignment,
+    serializeArrangement: serializeArrangement,
+    applyArrangement: applyArrangement,
+    setAllIncluded: setAllIncluded,
+    listIssueTemplates: listIssueTemplates,
+    saveIssueTemplate: saveIssueTemplate,
+    savePlanDraft: savePlanDraft,
+    loadPlanDraft: loadPlanDraft,
   };
 
   console.info(TAG + ' v' + VERSION + ' loaded');
