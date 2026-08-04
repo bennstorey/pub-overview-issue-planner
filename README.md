@@ -34,15 +34,39 @@ No transpilation or minification — the deployed file stays readable in the con
 
 ## Deploy
 
-The `dist` file has to be served from a public HTTPS URL. The Publication Overview PDF
-plug-in uses GitHub Pages for this; this repo is not on GitHub yet, so that has to be set
-up before the plug-in can be registered.
+The bundle is served from GitHub Pages, same as the Publication Overview PDF plug-in:
 
-Then, once per server: **Management Console → Integrations → Plug-ins →
-Publication Overview** section (not "Studio" — this plug-in uses `PoUiSdk`, which only
-exists in the Publication Overview child application) → Add new → paste the URL → enable.
+```
+https://bennstorey.github.io/issue-creator-plugin/dist/issue-creator-plugin.js
+```
+
+Publishing is one command from the parent repo, which stays the source of truth — the
+public repo is produced from `plugin/` with `git subtree`, so there is no second copy to
+keep in sync:
+
+```
+./scripts/publish-plugin.sh
+```
 
 Users need a hard refresh (Cmd-Shift-R) of Studio after a deploy.
+
+### One-time setup
+
+1. **Create the repo.** On github.com, new **public** repo named `issue-creator-plugin`,
+   owner `bennstorey`. Leave it completely empty — no README, no .gitignore, no licence —
+   or the first subtree push will be rejected as a non-fast-forward.
+2. **Publish.** Run `./scripts/publish-plugin.sh`. It adds the remote, rebuilds, refuses to
+   ship a stale or uncommitted bundle, and pushes.
+3. **Enable Pages.** Repo → Settings → Pages → Source: *Deploy from a branch*, branch
+   `main`, folder `/ (root)`. Wait a minute, then confirm the URL above loads the
+   JavaScript rather than a 404.
+4. **Register in Studio.** Management Console → Integrations → Plug-ins →
+   **Publication Overview** section (not "Studio" — this plug-in uses `PoUiSdk`, which only
+   exists in the Publication Overview child application) → Add new → paste the URL →
+   enable.
+
+Only the plug-in is public. The research notes, the superseded Electron PoC and the
+customer context stay in the private parent repo.
 
 ## Architecture
 
