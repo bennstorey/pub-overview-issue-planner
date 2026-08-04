@@ -87,12 +87,18 @@
       confirmBtn.disabled = !ok;
     });
 
+    // The filter's key names are undocumented and not all are what the notes
+    // suggest — log the raw object so a wrong assumption is visible, not silent.
+    console.info(TAG + ' currentFilterSetting():', filter);
+
     loadContextNames(filter).then(function (ctx) {
       state.ctx = ctx;
       row('Brand', ctx.publication + ' (' + ctx.publicationId + ')');
-      row('Issue', ctx.issue + ' (' + filter.issueId + ')');
-      row('Channel', ctx.pubChannel || '—');
-      row('Section', ctx.section || '—');
+      row('Issue', ctx.issue + ' (' + ctx.issueId + ')');
+      row('Channel', ctx.pubChannel + ' (' + ctx.pubChannelId + ')');
+      row('Section', ctx.section
+        ? ctx.section + (ctx.sectionDefaulted ? ' — defaulted, no category selected' : '')
+        : '— none available');
       return loadTemplates(ctx.publicationId);
     }).then(function (templates) {
       state.templates = templates;
@@ -128,7 +134,11 @@
     // Step 2 of the build plan: pin down the __classname__ strategy by creating
     // one throwaway layout on the first free page, through the real client.
     confirmBtn.addEventListener('click', function () {
-      if (!state.ctx || !state.templates.length) { notify('Still loading.', 'error'); return; }
+      if (!state.ctx) { notify('Still resolving the brand and issue — try again in a moment.', 'error'); return; }
+      if (!state.templates.length) {
+        notify('No layout templates in ' + state.ctx.publication + ', so there is nothing to create from.', 'error');
+        return;
+      }
       var template = state.templates[0];
       var page = 1;
       while (state.model && state.model.occupied[page]) page++;

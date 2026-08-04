@@ -21,7 +21,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '0.1.0';
+  var VERSION = '0.1.1';
   var TAG = '[issue-creator]';
 
   if (typeof PoUiSdk === 'undefined') {
@@ -280,40 +280,74 @@
 
   // Names are what the Planning API identifies brand/issue/channel/section by,
   // and currentFilterSetting() only gives ids — so resolve them once.
-  function loadContextNames(filter) {
-    return callServer('GetPublications', {
-      PublicationIds: filter.brandId ? [String(filter.brandId)] : null,
-      RequestInfo: ['PubChannels', 'Issues', 'Categories'],
-    }).then(function (r) {
-      var pub = (r.Publications || [])[0];
-      if (!pub) throw new Error('Brand ' + filter.brandId + ' not readable');
-
-      var channelName = '';
-      var issueName = '';
+  //
+  // The brand is deliberately resolved by finding which publication actually
+  // contains the issue, rather than trusting a brand id off the filter. The
+  // filter's key for it is undocumented and was not `brandId` on this server,
+  // and guessing wrong is silently catastrophic: PublicationIds null returns
+  // every brand, and taking the first gives a plausible-looking but completely
+  // unrelated brand.
+  function findIssue(publications, issueId) {
+    for (var p = 0; p < publications.length; p++) {
+      var pub = publications[p];
       var chans = pub.PubChannels || [];
-      for (var c = 0; c < chans.length && !issueName; c++) {
+      for (var c = 0; c < chans.length; c++) {
         var issues = chans[c].Issues || [];
         for (var i = 0; i < issues.length; i++) {
-          if (String(issues[i].Id) === String(filter.issueId)) {
-            issueName = issues[i].Name;
-            channelName = chans[c].Name;
-            break;
+          if (String(issues[i].Id) === String(issueId)) {
+            return { pub: pub, channel: chans[c], issue: issues[i] };
           }
         }
       }
+    }
+    return null;
+  }
 
+  function loadContextNames(filter) {
+    // Whatever the filter calls the brand, use it as a hint to keep the common
+    // case to one small response; fall back to every brand if the issue is not
+    // in there.
+    var hint = filter.brandId || filter.publicationId || filter.pubId || filter.brand || null;
+    var request = { RequestInfo: ['PubChannels', 'Issues', 'Categories'] };
+
+    function fetchPubs(ids) {
+      return callServer('GetPublications', Object.assign({ PublicationIds: ids }, request))
+        .then(function (r) { return r.Publications || []; });
+    }
+
+    return fetchPubs(hint ? [String(hint)] : null).then(function (pubs) {
+      var found = findIssue(pubs, filter.issueId);
+      if (found) return found;
+      // Hint was absent, wrong, or pointed at a brand without this issue.
+      if (hint) {
+        return fetchPubs(null).then(function (all) { return findIssue(all, filter.issueId); });
+      }
+      return null;
+    }).then(function (found) {
+      if (!found) throw new Error('Could not find issue ' + filter.issueId + ' in any brand you can read');
+
+      // Section is Studio's Category. The user may be filtered to "All
+      // categories", in which case there is nothing to infer — but created
+      // layouts still need one, so fall back to the brand's first and say so
+      // rather than choosing silently.
+      var cats = found.pub.Categories || [];
       var sectionName = '';
-      var cats = pub.Categories || [];
+      var defaulted = false;
       for (var k = 0; k < cats.length; k++) {
         if (String(cats[k].Id) === String(filter.categoryId)) { sectionName = cats[k].Name; break; }
       }
+      if (!sectionName && cats.length) { sectionName = cats[0].Name; defaulted = true; }
 
       return {
-        publication: pub.Name,
-        publicationId: String(pub.Id),
-        issue: issueName,
-        pubChannel: channelName,
+        publication: found.pub.Name,
+        publicationId: String(found.pub.Id),
+        issue: found.issue.Name,
+        issueId: String(found.issue.Id),
+        pubChannel: found.channel.Name,
+        pubChannelId: String(found.channel.Id),
         section: sectionName,
+        sectionDefaulted: defaulted,
+        categories: cats.map(function (c) { return { id: String(c.Id), name: c.Name }; }),
       };
     });
   }
@@ -503,12 +537,18 @@
       confirmBtn.disabled = !ok;
     });
 
+    // The filter's key names are undocumented and not all are what the notes
+    // suggest — log the raw object so a wrong assumption is visible, not silent.
+    console.info(TAG + ' currentFilterSetting():', filter);
+
     loadContextNames(filter).then(function (ctx) {
       state.ctx = ctx;
       row('Brand', ctx.publication + ' (' + ctx.publicationId + ')');
-      row('Issue', ctx.issue + ' (' + filter.issueId + ')');
-      row('Channel', ctx.pubChannel || '—');
-      row('Section', ctx.section || '—');
+      row('Issue', ctx.issue + ' (' + ctx.issueId + ')');
+      row('Channel', ctx.pubChannel + ' (' + ctx.pubChannelId + ')');
+      row('Section', ctx.section
+        ? ctx.section + (ctx.sectionDefaulted ? ' — defaulted, no category selected' : '')
+        : '— none available');
       return loadTemplates(ctx.publicationId);
     }).then(function (templates) {
       state.templates = templates;
@@ -544,7 +584,11 @@
     // Step 2 of the build plan: pin down the __classname__ strategy by creating
     // one throwaway layout on the first free page, through the real client.
     confirmBtn.addEventListener('click', function () {
-      if (!state.ctx || !state.templates.length) { notify('Still loading.', 'error'); return; }
+      if (!state.ctx) { notify('Still resolving the brand and issue — try again in a moment.', 'error'); return; }
+      if (!state.templates.length) {
+        notify('No layout templates in ' + state.ctx.publication + ', so there is nothing to create from.', 'error');
+        return;
+      }
       var template = state.templates[0];
       var page = 1;
       while (state.model && state.model.occupied[page]) page++;
