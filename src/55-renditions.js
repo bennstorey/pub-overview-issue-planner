@@ -65,3 +65,57 @@
   }
 
   function thumbUrl(id) { return thumbCache[String(id)] || null; }
+
+  // ── Per-page thumbnails ───────────────────────────────────────────────────
+  // An object's own 'thumb' rendition is a single image — for a multi-page
+  // layout that is just its first spread, so a 4-page template appears to be
+  // 2 pages. RequestInfo ['Pages'] returns a thumb per page instead, which is
+  // what a spread slot should show.
+
+  var pageThumbCache = {}; // objectId -> [url] | null
+
+  function loadPageThumbUrls(ids) {
+    var wanted = [];
+    for (var i = 0; i < ids.length; i++) {
+      var id = String(ids[i]);
+      if (id && !(id in pageThumbCache) && wanted.indexOf(id) === -1) wanted.push(id);
+    }
+    if (!wanted.length) return Promise.resolve();
+
+    return callServer('GetObjects', {
+      IDs: wanted,
+      Lock: false,
+      Rendition: 'thumb',
+      RequestInfo: ['Pages'],
+      HaveVersions: null,
+      Areas: null,
+      EditionId: null,
+      SupportedContentSources: null,
+    }).then(function (r) {
+      var objs = r.Objects || [];
+      for (var o = 0; o < objs.length; o++) {
+        var obj = objs[o];
+        var oid = obj.MetaData && obj.MetaData.BasicMetaData && String(obj.MetaData.BasicMetaData.ID);
+        if (!oid) continue;
+        var pages = (obj.Pages || []).slice().sort(function (a, b) {
+          return (Number(a.PageOrder) || 0) - (Number(b.PageOrder) || 0);
+        });
+        var urls = [];
+        for (var p = 0; p < pages.length; p++) {
+          var files = pages[p].Files || [];
+          for (var f = 0; f < files.length; f++) {
+            if (files[f].Rendition === 'thumb' && files[f].FileUrl) { urls.push(withWwApp(files[f].FileUrl)); break; }
+          }
+        }
+        pageThumbCache[oid] = urls.length ? urls : null;
+      }
+      for (var w = 0; w < wanted.length; w++) {
+        if (!(wanted[w] in pageThumbCache)) pageThumbCache[wanted[w]] = null;
+      }
+    }).catch(function (e) {
+      console.warn(TAG + ' per-page thumbnail load failed: ' + e.message);
+      for (var w2 = 0; w2 < wanted.length; w2++) pageThumbCache[wanted[w2]] = null;
+    });
+  }
+
+  function pageThumbUrls(id) { return pageThumbCache[String(id)] || null; }

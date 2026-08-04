@@ -132,7 +132,7 @@
 
     grid.slots[i] = {
       page: grid.slots[i].page, templateId: template.id, templateName: template.name,
-      span: span, covered: false,
+      templateCategory: template.category || '', span: span, covered: false,
     };
     for (var k = i + 1; k < i + span; k++) {
       grid.slots[k] = { page: grid.slots[k].page, templateId: null, templateName: null, span: 1, covered: true };
@@ -147,6 +147,10 @@
 
   // The slots a create run should act on: assigned, not covered, not existing.
   // Empty slots are included only when a blank template is configured.
+  //
+  // `section` is the template's own category — a layout made from the News
+  // template belongs in News, regardless of what the page grid is filtered to.
+  // Left empty when the template has none, and the caller falls back.
   function plannedSlots(blankTemplate) {
     var out = [];
     for (var i = 0; i < grid.slots.length; i++) {
@@ -156,11 +160,13 @@
         out.push({
           page: s.page, pageEnd: s.page + (s.span || 1) - 1,
           templateId: s.templateId, templateName: s.templateName,
+          section: s.templateCategory || '',
         });
       } else if (blankTemplate) {
         out.push({
           page: s.page, pageEnd: s.page + (blankTemplate.pageCount || 1) - 1,
           templateId: blankTemplate.id, templateName: blankTemplate.name,
+          section: blankTemplate.category || '',
         });
       }
     }
@@ -183,7 +189,8 @@
 
   function renderGrid(container) {
     container.textContent = '';
-    var pending = [];
+    var pending = [];       // objects still missing a single thumb
+    var pendingPages = [];  // spreads still missing their per-page thumbs
 
     grid.slots.forEach(function (slot, i) {
       if (slot.covered) return; // drawn as part of the owning spread
@@ -199,12 +206,22 @@
 
       var thumbId = slot.existing ? slot.existing.id : slot.templateId;
       var thumbBox = el('div', { class: 'ic-slot-thumb' });
+      // A multi-page object's own thumb is only its first spread, so show one
+      // preview per page whenever we have them.
+      var perPage = thumbId && span > 1 ? pageThumbUrls(thumbId) : null;
       var url = thumbId ? thumbUrl(thumbId) : null;
-      if (url) {
+      if (perPage && perPage.length) {
+        var strip = el('div', { class: 'ic-page-strip' });
+        perPage.forEach(function (u) { strip.appendChild(el('img', { src: u, alt: '' })); });
+        thumbBox.appendChild(strip);
+      } else if (url) {
         thumbBox.appendChild(el('img', { src: url, alt: '' }));
       } else {
         thumbBox.appendChild(el('span', { class: 'ic-slot-empty', text: thumbId ? '…' : 'blank' }));
-        if (thumbId) pending.push(String(thumbId));
+      }
+      if (thumbId) {
+        if (!url) pending.push(String(thumbId));
+        if (span > 1 && !perPage) pendingPages.push(String(thumbId));
       }
 
       var label = span > 1
@@ -217,10 +234,14 @@
       var sub = slot.existing
         ? slot.existing.name + (slot.existing.stateName ? ' · ' + slot.existing.stateName : '')
         : (slot.templateName || '—');
+      var subTitle = slot.existing ? sub
+        : (slot.templateName
+            ? slot.templateName + (slot.templateCategory ? '\ncategory: ' + slot.templateCategory : '\nno category on this template')
+            : 'empty');
 
       node.appendChild(thumbBox);
       node.appendChild(pageLine);
-      node.appendChild(el('div', { class: 'ic-slot-tpl', title: sub, text: sub }));
+      node.appendChild(el('div', { class: 'ic-slot-tpl', title: subTitle, text: sub }));
 
       if (slot.templateId && !slot.existing) {
         var clear = el('button', { class: 'ic-slot-clear', title: 'Clear', text: '×' });
@@ -246,9 +267,13 @@
       container.appendChild(node);
     });
 
-    // Thumbnails we did not have yet: fetch, then redraw once.
-    if (pending.length) {
-      loadThumbUrls(pending).then(function () {
+    // Thumbnails we did not have yet: fetch, then redraw once. Both requests go
+    // together so a spread does not trigger two separate redraws.
+    if (pending.length || pendingPages.length) {
+      Promise.all([
+        pending.length ? loadThumbUrls(pending) : Promise.resolve(),
+        pendingPages.length ? loadPageThumbUrls(pendingPages) : Promise.resolve(),
+      ]).then(function () {
         if (grid.onChange) grid.onChange();
       });
     }

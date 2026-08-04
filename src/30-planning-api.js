@@ -28,8 +28,12 @@
 
   function cls(name) { return name ? { __classname__: name } : {}; }
 
-  // slot: { page, pageEnd, templateId, templateName, name }
+  // slot: { page, pageEnd, templateId, templateName, name, section }
   // ctx:  { publication, issue, pubChannel, section }
+  //
+  // Section (Studio's Category) comes from the slot's own template — a layout
+  // built from the News template belongs in News — and falls back to the
+  // context's section only when the template has no category of its own.
   function buildLayoutFromTemplate(slot, ctx) {
     var s = CLASSNAME_STRATEGIES[strategy];
     var end = slot.pageEnd || slot.page;
@@ -45,7 +49,7 @@
         Publication: ctx.publication,
         Issue: ctx.issue,
         PubChannel: ctx.pubChannel,
-        Section: ctx.section,
+        Section: slot.section || ctx.section,
         Pages: pages,
         // Status is deliberately never sent: the SDK docs state that object
         // state is determined by the editorial system, not the plan system.

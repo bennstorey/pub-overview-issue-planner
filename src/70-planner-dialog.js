@@ -23,6 +23,10 @@
     '.ic-slot.ic-existing .ic-slot-thumb{filter:grayscale(35%)}',
     '.ic-slot-thumb{height:96px;display:flex;align-items:center;justify-content:center;background:#eee;border-radius:4px;overflow:hidden}',
     '.ic-slot-thumb img{max-width:100%;max-height:100%}',
+    // One preview per page across a spread, since an object thumb only shows
+    // its first spread.
+    '.ic-page-strip{display:flex;gap:2px;height:100%;width:100%;align-items:center;justify-content:center}',
+    '.ic-page-strip img{max-height:100%;min-width:0;object-fit:contain;flex:0 1 auto}',
     '.ic-slot-empty{color:#999;font-size:11px}',
     '.ic-slot-page{font-weight:700;font-size:11px;margin-top:5px;display:flex;gap:4px;justify-content:center;align-items:center;flex-wrap:wrap}',
     '.ic-badge{font-weight:600;font-size:9px;background:#e8eaed;color:#444;border-radius:8px;padding:1px 6px}',
@@ -144,8 +148,15 @@
       }
       state.templates.forEach(function (t) {
         var thumb = el('div', { class: 'ic-tpl-thumb' });
+        var perPage = t.pageCount > 1 ? pageThumbUrls(t.id) : null;
         var url = thumbUrl(t.id);
-        if (url) thumb.appendChild(el('img', { src: url, alt: '' }));
+        if (perPage && perPage.length) {
+          var strip = el('div', { class: 'ic-page-strip' });
+          perPage.forEach(function (u) { strip.appendChild(el('img', { src: u, alt: '' })); });
+          thumb.appendChild(strip);
+        } else if (url) {
+          thumb.appendChild(el('img', { src: url, alt: '' }));
+        }
         var row = el('div', { class: 'ic-tpl', title: t.name }, [
           thumb,
           el('div', {}, [
@@ -172,17 +183,25 @@
 
     loadContextNames(filter).then(function (ctx) {
       state.ctx = ctx;
+      // Section now comes from each template's own category; ctx.section is only
+      // the fallback for templates that have none.
       ctxLine.textContent = ctx.publication + ' · ' + ctx.issue + ' · ' + ctx.pubChannel +
-        ' · section ' + (ctx.section || '—') + (ctx.sectionDefaulted ? ' (defaulted)' : '');
+        ' · category from template, else ' + (ctx.section || '—');
       return loadTemplates(ctx.publicationId);
     }).then(function (templates) {
       state.templates = templates;
       state.blank = guessBlankTemplate(templates, settings.blankTemplateHint);
       renderTemplates();
       refresh();
-      return loadThumbUrls(templates.map(function (t) { return t.id; }));
+      var multiPage = templates.filter(function (t) { return t.pageCount > 1; })
+        .map(function (t) { return t.id; });
+      return Promise.all([
+        loadThumbUrls(templates.map(function (t) { return t.id; })),
+        multiPage.length ? loadPageThumbUrls(multiPage) : null,
+      ]);
     }).then(function () {
       renderTemplates();
+      refresh();
     }).catch(function (e) {
       ctxLine.textContent = 'failed';
       setStatus(e.message, 'error');

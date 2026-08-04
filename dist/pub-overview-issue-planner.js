@@ -21,7 +21,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '0.2.0';
+  var VERSION = '0.3.0';
   var TAG = '[issue-creator]';
 
   if (typeof PoUiSdk === 'undefined') {
@@ -171,8 +171,12 @@
 
   function cls(name) { return name ? { __classname__: name } : {}; }
 
-  // slot: { page, pageEnd, templateId, templateName, name }
+  // slot: { page, pageEnd, templateId, templateName, name, section }
   // ctx:  { publication, issue, pubChannel, section }
+  //
+  // Section (Studio's Category) comes from the slot's own template — a layout
+  // built from the News template belongs in News — and falls back to the
+  // context's section only when the template has no category of its own.
   function buildLayoutFromTemplate(slot, ctx) {
     var s = CLASSNAME_STRATEGIES[strategy];
     var end = slot.pageEnd || slot.page;
@@ -188,7 +192,7 @@
         Publication: ctx.publication,
         Issue: ctx.issue,
         PubChannel: ctx.pubChannel,
-        Section: ctx.section,
+        Section: slot.section || ctx.section,
         Pages: pages,
         // Status is deliberately never sent: the SDK docs state that object
         // state is determined by the editorial system, not the plan system.
@@ -503,6 +507,60 @@
 
   function thumbUrl(id) { return thumbCache[String(id)] || null; }
 
+  // ── Per-page thumbnails ───────────────────────────────────────────────────
+  // An object's own 'thumb' rendition is a single image — for a multi-page
+  // layout that is just its first spread, so a 4-page template appears to be
+  // 2 pages. RequestInfo ['Pages'] returns a thumb per page instead, which is
+  // what a spread slot should show.
+
+  var pageThumbCache = {}; // objectId -> [url] | null
+
+  function loadPageThumbUrls(ids) {
+    var wanted = [];
+    for (var i = 0; i < ids.length; i++) {
+      var id = String(ids[i]);
+      if (id && !(id in pageThumbCache) && wanted.indexOf(id) === -1) wanted.push(id);
+    }
+    if (!wanted.length) return Promise.resolve();
+
+    return callServer('GetObjects', {
+      IDs: wanted,
+      Lock: false,
+      Rendition: 'thumb',
+      RequestInfo: ['Pages'],
+      HaveVersions: null,
+      Areas: null,
+      EditionId: null,
+      SupportedContentSources: null,
+    }).then(function (r) {
+      var objs = r.Objects || [];
+      for (var o = 0; o < objs.length; o++) {
+        var obj = objs[o];
+        var oid = obj.MetaData && obj.MetaData.BasicMetaData && String(obj.MetaData.BasicMetaData.ID);
+        if (!oid) continue;
+        var pages = (obj.Pages || []).slice().sort(function (a, b) {
+          return (Number(a.PageOrder) || 0) - (Number(b.PageOrder) || 0);
+        });
+        var urls = [];
+        for (var p = 0; p < pages.length; p++) {
+          var files = pages[p].Files || [];
+          for (var f = 0; f < files.length; f++) {
+            if (files[f].Rendition === 'thumb' && files[f].FileUrl) { urls.push(withWwApp(files[f].FileUrl)); break; }
+          }
+        }
+        pageThumbCache[oid] = urls.length ? urls : null;
+      }
+      for (var w = 0; w < wanted.length; w++) {
+        if (!(wanted[w] in pageThumbCache)) pageThumbCache[wanted[w]] = null;
+      }
+    }).catch(function (e) {
+      console.warn(TAG + ' per-page thumbnail load failed: ' + e.message);
+      for (var w2 = 0; w2 < wanted.length; w2++) pageThumbCache[wanted[w2]] = null;
+    });
+  }
+
+  function pageThumbUrls(id) { return pageThumbCache[String(id)] || null; }
+
   // ─── Naming patterns ───────────────────────────────────────────────────────
   // Ported unchanged from the Electron PoC, where it was exercised across
   // several real issue builds. Tokens: {issue} {brand} {template} {page}
@@ -676,7 +734,7 @@
 
     grid.slots[i] = {
       page: grid.slots[i].page, templateId: template.id, templateName: template.name,
-      span: span, covered: false,
+      templateCategory: template.category || '', span: span, covered: false,
     };
     for (var k = i + 1; k < i + span; k++) {
       grid.slots[k] = { page: grid.slots[k].page, templateId: null, templateName: null, span: 1, covered: true };
@@ -691,6 +749,10 @@
 
   // The slots a create run should act on: assigned, not covered, not existing.
   // Empty slots are included only when a blank template is configured.
+  //
+  // `section` is the template's own category — a layout made from the News
+  // template belongs in News, regardless of what the page grid is filtered to.
+  // Left empty when the template has none, and the caller falls back.
   function plannedSlots(blankTemplate) {
     var out = [];
     for (var i = 0; i < grid.slots.length; i++) {
@@ -700,11 +762,13 @@
         out.push({
           page: s.page, pageEnd: s.page + (s.span || 1) - 1,
           templateId: s.templateId, templateName: s.templateName,
+          section: s.templateCategory || '',
         });
       } else if (blankTemplate) {
         out.push({
           page: s.page, pageEnd: s.page + (blankTemplate.pageCount || 1) - 1,
           templateId: blankTemplate.id, templateName: blankTemplate.name,
+          section: blankTemplate.category || '',
         });
       }
     }
@@ -727,7 +791,8 @@
 
   function renderGrid(container) {
     container.textContent = '';
-    var pending = [];
+    var pending = [];       // objects still missing a single thumb
+    var pendingPages = [];  // spreads still missing their per-page thumbs
 
     grid.slots.forEach(function (slot, i) {
       if (slot.covered) return; // drawn as part of the owning spread
@@ -743,12 +808,22 @@
 
       var thumbId = slot.existing ? slot.existing.id : slot.templateId;
       var thumbBox = el('div', { class: 'ic-slot-thumb' });
+      // A multi-page object's own thumb is only its first spread, so show one
+      // preview per page whenever we have them.
+      var perPage = thumbId && span > 1 ? pageThumbUrls(thumbId) : null;
       var url = thumbId ? thumbUrl(thumbId) : null;
-      if (url) {
+      if (perPage && perPage.length) {
+        var strip = el('div', { class: 'ic-page-strip' });
+        perPage.forEach(function (u) { strip.appendChild(el('img', { src: u, alt: '' })); });
+        thumbBox.appendChild(strip);
+      } else if (url) {
         thumbBox.appendChild(el('img', { src: url, alt: '' }));
       } else {
         thumbBox.appendChild(el('span', { class: 'ic-slot-empty', text: thumbId ? '…' : 'blank' }));
-        if (thumbId) pending.push(String(thumbId));
+      }
+      if (thumbId) {
+        if (!url) pending.push(String(thumbId));
+        if (span > 1 && !perPage) pendingPages.push(String(thumbId));
       }
 
       var label = span > 1
@@ -761,10 +836,14 @@
       var sub = slot.existing
         ? slot.existing.name + (slot.existing.stateName ? ' · ' + slot.existing.stateName : '')
         : (slot.templateName || '—');
+      var subTitle = slot.existing ? sub
+        : (slot.templateName
+            ? slot.templateName + (slot.templateCategory ? '\ncategory: ' + slot.templateCategory : '\nno category on this template')
+            : 'empty');
 
       node.appendChild(thumbBox);
       node.appendChild(pageLine);
-      node.appendChild(el('div', { class: 'ic-slot-tpl', title: sub, text: sub }));
+      node.appendChild(el('div', { class: 'ic-slot-tpl', title: subTitle, text: sub }));
 
       if (slot.templateId && !slot.existing) {
         var clear = el('button', { class: 'ic-slot-clear', title: 'Clear', text: '×' });
@@ -790,9 +869,13 @@
       container.appendChild(node);
     });
 
-    // Thumbnails we did not have yet: fetch, then redraw once.
-    if (pending.length) {
-      loadThumbUrls(pending).then(function () {
+    // Thumbnails we did not have yet: fetch, then redraw once. Both requests go
+    // together so a spread does not trigger two separate redraws.
+    if (pending.length || pendingPages.length) {
+      Promise.all([
+        pending.length ? loadThumbUrls(pending) : Promise.resolve(),
+        pendingPages.length ? loadPageThumbUrls(pendingPages) : Promise.resolve(),
+      ]).then(function () {
         if (grid.onChange) grid.onChange();
       });
     }
@@ -823,6 +906,10 @@
     '.ic-slot.ic-existing .ic-slot-thumb{filter:grayscale(35%)}',
     '.ic-slot-thumb{height:96px;display:flex;align-items:center;justify-content:center;background:#eee;border-radius:4px;overflow:hidden}',
     '.ic-slot-thumb img{max-width:100%;max-height:100%}',
+    // One preview per page across a spread, since an object thumb only shows
+    // its first spread.
+    '.ic-page-strip{display:flex;gap:2px;height:100%;width:100%;align-items:center;justify-content:center}',
+    '.ic-page-strip img{max-height:100%;min-width:0;object-fit:contain;flex:0 1 auto}',
     '.ic-slot-empty{color:#999;font-size:11px}',
     '.ic-slot-page{font-weight:700;font-size:11px;margin-top:5px;display:flex;gap:4px;justify-content:center;align-items:center;flex-wrap:wrap}',
     '.ic-badge{font-weight:600;font-size:9px;background:#e8eaed;color:#444;border-radius:8px;padding:1px 6px}',
@@ -944,8 +1031,15 @@
       }
       state.templates.forEach(function (t) {
         var thumb = el('div', { class: 'ic-tpl-thumb' });
+        var perPage = t.pageCount > 1 ? pageThumbUrls(t.id) : null;
         var url = thumbUrl(t.id);
-        if (url) thumb.appendChild(el('img', { src: url, alt: '' }));
+        if (perPage && perPage.length) {
+          var strip = el('div', { class: 'ic-page-strip' });
+          perPage.forEach(function (u) { strip.appendChild(el('img', { src: u, alt: '' })); });
+          thumb.appendChild(strip);
+        } else if (url) {
+          thumb.appendChild(el('img', { src: url, alt: '' }));
+        }
         var row = el('div', { class: 'ic-tpl', title: t.name }, [
           thumb,
           el('div', {}, [
@@ -972,17 +1066,25 @@
 
     loadContextNames(filter).then(function (ctx) {
       state.ctx = ctx;
+      // Section now comes from each template's own category; ctx.section is only
+      // the fallback for templates that have none.
       ctxLine.textContent = ctx.publication + ' · ' + ctx.issue + ' · ' + ctx.pubChannel +
-        ' · section ' + (ctx.section || '—') + (ctx.sectionDefaulted ? ' (defaulted)' : '');
+        ' · category from template, else ' + (ctx.section || '—');
       return loadTemplates(ctx.publicationId);
     }).then(function (templates) {
       state.templates = templates;
       state.blank = guessBlankTemplate(templates, settings.blankTemplateHint);
       renderTemplates();
       refresh();
-      return loadThumbUrls(templates.map(function (t) { return t.id; }));
+      var multiPage = templates.filter(function (t) { return t.pageCount > 1; })
+        .map(function (t) { return t.id; });
+      return Promise.all([
+        loadThumbUrls(templates.map(function (t) { return t.id; })),
+        multiPage.length ? loadPageThumbUrls(multiPage) : null,
+      ]);
     }).then(function () {
       renderTemplates();
+      refresh();
     }).catch(function (e) {
       ctxLine.textContent = 'failed';
       setStatus(e.message, 'error');

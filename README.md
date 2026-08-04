@@ -18,7 +18,11 @@ Open **Create pages…** in the Publication Overview triple-dot menu:
   workflow state, and the grid extends if they run past the requested count
 - Click a page, then a template, to assign it. Multi-page templates span consecutive pages
   and the selection auto-advances past the spread. `×` clears
-- Templates list with thumbnails and page counts; the blank-page template is auto-detected
+- Templates list with previews and page counts; the blank-page template is auto-detected
+- Multi-page templates and spreads show **one preview per page**. An object's own `thumb`
+  rendition is only its first spread, so a 4-page template would otherwise look like 2
+  pages; `RequestInfo: ['Pages']` returns a thumb per page instead
+- Each layout takes its category from its own template, not from the page grid's filter
 - **Create** sends the whole plan in one `CreateLayouts` call, then re-reads the issue to
   verify the pages actually landed
 
@@ -131,6 +135,11 @@ The payload, as sent and accepted:
 
 `Status` is deliberately never sent: the SDK docs state object state is determined by the
 editorial system, not the plan system. The server assigned `Draft` on the confirmation run.
+
+`Section` is Studio's Category, and is **per layout, taken from its own template** — a page
+built from the News template lands in News regardless of what the grid is filtered to. It
+falls back to the filter's category, or the brand's first, only for a template that has no
+category of its own.
 
 **The response cannot confirm the page plan.** Its `Layouts` carry `Id`, `Name` and the
 resolved `Publication` / `Issue` / `PubChannel` / `Section` / `Status`, but `Pages` comes
