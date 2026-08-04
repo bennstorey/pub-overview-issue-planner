@@ -1,14 +1,17 @@
 #!/usr/bin/env node
 /**
  * Concatenates src/*.js (sorted by filename — the numeric prefixes define the
- * order) into dist/issue-creator-plugin.js. No transpilation, no minification:
- * the deployed file stays debuggable in the browser console.
+ * order) into dist/pub-overview-issue-planner.js. No transpilation, no
+ * minification: the deployed file stays debuggable in the browser console.
+ *
+ * The bundle name matches the public repo it is served from, so the Management
+ * Console URL reads consistently.
  */
 const fs = require('fs');
 const path = require('path');
 
 const srcDir = path.join(__dirname, 'src');
-const outFile = path.join(__dirname, 'dist', 'issue-creator-plugin.js');
+const outFile = path.join(__dirname, 'dist', 'pub-overview-issue-planner.js');
 
 const files = fs.readdirSync(srcDir).filter((f) => f.endsWith('.js')).sort();
 if (!files.length) {

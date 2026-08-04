@@ -27,7 +27,7 @@ and plan drafts, and the create run itself.
 ## Build
 
 ```
-node build-plugin.js     # writes dist/issue-creator-plugin.js
+node build-plugin.js     # writes dist/pub-overview-issue-planner.js
 ```
 
 No transpilation or minification — the deployed file stays readable in the console.
@@ -37,7 +37,7 @@ No transpilation or minification — the deployed file stays readable in the con
 The bundle is served from GitHub Pages, same as the Publication Overview PDF plug-in:
 
 ```
-https://bennstorey.github.io/issue-creator-plugin/dist/issue-creator-plugin.js
+https://bennstorey.github.io/pub-overview-issue-planner/dist/pub-overview-issue-planner.js
 ```
 
 Publishing is one command from the parent repo, which stays the source of truth — the
@@ -52,7 +52,7 @@ Users need a hard refresh (Cmd-Shift-R) of Studio after a deploy.
 
 ### One-time setup
 
-1. **Create the repo.** On github.com, new **public** repo named `issue-creator-plugin`,
+1. **Create the repo.** On github.com, new **public** repo named `pub-overview-issue-planner`,
    owner `bennstorey`. Leave it completely empty — no README, no .gitignore, no licence —
    or the first subtree push will be rejected as a non-fast-forward.
 2. **Publish.** Run `./scripts/publish-plugin.sh`. It adds the remote, rebuilds, refuses to
