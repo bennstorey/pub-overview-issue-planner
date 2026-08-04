@@ -6,19 +6,25 @@
   //
   // Studio's JSON-RPC is strongly typed: nested objects need a __classname__ or
   // the deserializer drops every field and reports them as unspecified. The
-  // planning interface's exact type names are not in the SDK docs, so the
-  // strategy is configurable and confirmProtocol() below pins it down.
+  // planning interface's type names are not in the SDK docs; confirmProtocol()
+  // established them against Studio 10.67 by trying each in turn.
+  //
+  // CONFIRMED 2026-08-04: this server wants the Pln-prefixed names. The bare
+  // names that the workflow interface uses are rejected here, so the two
+  // interfaces do not share a convention despite sharing the field names.
 
   var CLASSNAME_STRATEGIES = {
-    // Matches the workflow interface convention (bare entity names).
-    bare: { fromTemplate: 'LayoutFromTemplate', layout: 'Layout', page: 'Page' },
-    // Matches the Pln prefix seen on PlnCreateLayoutsResponse.
+    // Confirmed on Studio 10.67; matches the PlnLayout that comes back in the
+    // CreateLayouts response.
     pln: { fromTemplate: 'PlnLayoutFromTemplate', layout: 'PlnLayout', page: 'PlnPage' },
+    // The workflow interface's convention. Rejected by the planning endpoint on
+    // 10.67; kept in case another version differs.
+    bare: { fromTemplate: 'LayoutFromTemplate', layout: 'Layout', page: 'Page' },
     // No markers at all — known to fail, kept so confirmProtocol can prove it.
     none: { fromTemplate: null, layout: null, page: null },
   };
 
-  var strategy = 'bare';
+  var strategy = 'pln';
 
   function cls(name) { return name ? { __classname__: name } : {}; }
 
@@ -49,6 +55,11 @@
 
   // Create many layouts in one request — CreateLayouts takes an array, so a
   // whole issue can go up at once.
+  //
+  // Note the response's Layouts carry Id, Name and the resolved
+  // Publication/Issue/PubChannel/Section/Status, but `Pages` comes back null.
+  // So the response cannot confirm the page plan landed: verify with
+  // loadIssueModel() or by reading PlannedPageRange afterwards.
   function createLayouts(slots, ctx) {
     var payload = { Layouts: slots.map(function (slot) { return buildLayoutFromTemplate(slot, ctx); }) };
     return callPlanning('CreateLayouts', payload).then(function (r) {
@@ -71,7 +82,7 @@
   // creating a single throwaway layout. Sets `strategy` on success. Exposed on
   // the debug object rather than run automatically — it creates a real object.
   function confirmProtocol(slot, ctx) {
-    var order = ['bare', 'pln', 'none'];
+    var order = ['pln', 'bare', 'none'];
     var attempt = 0;
     function next() {
       if (attempt >= order.length) {

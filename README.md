@@ -91,26 +91,31 @@ deserializer drops every field and reports them as unspecified — the first pro
 with "layout template, layout name, Publication or Issue was not specified" while sending
 all four.
 
-The planning interface's exact type names are not in the SDK docs. `30-planning-api.js`
-keeps three strategies (`bare`, `pln`, `none`) and defaults to `bare`, which matches the
-workflow interface's convention and is what the browser probe appears to have used.
-**Confirm protocol** in the dialog tries each in turn against a real create and reports
-which one the server accepts; set `strategy` to that value once known.
+The planning interface's type names are not in the SDK docs. **Confirmed on Studio 10.67:
+it wants the `Pln`-prefixed names**, and rejects the bare names the workflow interface
+uses — so the two interfaces do not share a convention despite sharing field names.
 
-The payload `bare` produces, verified against the built bundle:
+`30-planning-api.js` defaults to `pln` and keeps `bare` and `none` in case another version
+differs; **Confirm protocol** in the dialog re-establishes it against a real create.
+
+The payload, as sent and accepted:
 
 ```json
-{ "Layouts": [ { "__classname__": "LayoutFromTemplate",
+{ "Layouts": [ { "__classname__": "PlnLayoutFromTemplate",
                  "Template": "Print template A",
-                 "NewLayout": { "__classname__": "Layout",
+                 "NewLayout": { "__classname__": "PlnLayout",
                    "Name": "...", "Publication": "...", "Issue": "...",
                    "PubChannel": "Print", "Section": "News",
-                   "Pages": [ { "__classname__": "Page", "PageOrder": 20, "PageSequence": 1 } ] } } ],
+                   "Pages": [ { "__classname__": "PlnPage", "PageOrder": 20, "PageSequence": 1 } ] } } ],
   "Ticket": null }
 ```
 
 `Status` is deliberately never sent: the SDK docs state object state is determined by the
-editorial system, not the plan system.
+editorial system, not the plan system. The server assigned `Draft` on the confirmation run.
+
+**The response cannot confirm the page plan.** Its `Layouts` carry `Id`, `Name` and the
+resolved `Publication` / `Issue` / `PubChannel` / `Section` / `Status`, but `Pages` comes
+back `null`. Verify with `loadIssueModel()` or by reading `PlannedPageRange`.
 
 ## Notes
 
