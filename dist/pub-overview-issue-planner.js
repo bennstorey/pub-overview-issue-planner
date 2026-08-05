@@ -21,7 +21,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '0.6.0';
+  var VERSION = '0.7.0';
   var TAG = '[issue-creator]';
 
   if (typeof PoUiSdk === 'undefined') {
@@ -200,10 +200,16 @@
         user: profile.user, groups: profile.groups,
       };
       if (!allowed) {
-        console.info(TAG + ' hidden: ' + (profile.user.UserID || 'this user') +
-          ' is in [' + profile.groups.join(', ') + '], none of which is an admin group [' +
-          adminGroups.join(', ') + ']. Adjust with ' +
-          '__issueCreator.setAdminGroups([...]) if this server names them differently.');
+        // Group names are per-instance, so this is the expected first
+        // experience on a new Studio — say plainly how to fix it, since a
+        // missing menu entry gives the user nothing else to go on.
+        console.warn(TAG + ' menu hidden — no admin group matched.\n' +
+          '  user:            ' + (profile.user.UserID || 'unknown') + '\n' +
+          '  member of:       [' + profile.groups.join(', ') + ']\n' +
+          '  looking for any: [' + adminGroups.join(', ') + ']\n' +
+          '  If this instance names its admin group differently, run:\n' +
+          "    __issueCreator.setAdminGroups(['" + (profile.groups[0] || 'Your Group') + "'])\n" +
+          '  then reload Studio.');
       }
       return allowed;
     }).catch(function (e) {
@@ -241,7 +247,14 @@
     none: { fromTemplate: null, layout: null, page: null },
   };
 
-  var strategy = 'pln';
+  // Confirmed default, overridden by whatever this origin last found to work —
+  // localStorage is per-origin, so each Studio instance remembers its own.
+  var strategy = (function () {
+    try {
+      var saved = loadSettings().classnameStrategy;
+      return (saved && CLASSNAME_STRATEGIES[saved]) ? saved : 'pln';
+    } catch (e) { return 'pln'; }
+  }());
 
   function cls(name) { return name ? { __classname__: name } : {}; }
 
@@ -282,10 +295,61 @@
   // So the response cannot confirm the page plan landed: verify with
   // loadIssueModel() or by reading PlannedPageRange afterwards.
   function createLayouts(slots, ctx) {
-    var payload = { Layouts: slots.map(function (slot) { return buildLayoutFromTemplate(slot, ctx); }) };
+    return attemptCreate(slots, ctx, strategy).catch(function (err) {
+      // The type names are a Studio *version* dependency, not an instance one,
+      // so a bundle proven on 10.67 may meet a server that wants different ones.
+      // Retry across the alternatives, but only on the signature of a
+      // deserialization failure — where nothing was created. Retrying a
+      // genuine failure (a name clash, say) could duplicate work.
+      if (!looksLikeClassnameMismatch(err)) throw err;
+
+      var alternatives = Object.keys(CLASSNAME_STRATEGIES).filter(function (k) { return k !== strategy; });
+      console.warn(TAG + ' CreateLayouts rejected with strategy "' + strategy +
+        '" — trying ' + alternatives.join(', ') + '. Original error: ' + err.message);
+
+      function next(i) {
+        if (i >= alternatives.length) throw err; // report the original failure
+        var candidate = alternatives[i];
+        return attemptCreate(slots, ctx, candidate).then(function (layouts) {
+          strategy = candidate; // remember for the rest of this session
+          rememberStrategy(candidate);
+          console.info(TAG + ' this server wants __classname__ strategy "' + candidate + '"');
+          return layouts;
+        }).catch(function (e) {
+          if (!looksLikeClassnameMismatch(e)) throw e;
+          return next(i + 1);
+        });
+      }
+      return next(0);
+    });
+  }
+
+  function attemptCreate(slots, ctx, useStrategy) {
+    var previous = strategy;
+    strategy = useStrategy;
+    var payload;
+    try {
+      payload = { Layouts: slots.map(function (slot) { return buildLayoutFromTemplate(slot, ctx); }) };
+    } finally {
+      strategy = previous;
+    }
     return callPlanning('CreateLayouts', payload).then(function (r) {
       return (r && r.Layouts) || [];
     });
+  }
+
+  // A wrong __classname__ makes the deserializer drop every field, so the server
+  // complains that required values are absent even though they were all sent.
+  function looksLikeClassnameMismatch(err) {
+    return /not specified|missing function parameter|S1000/i.test(String(err && err.message));
+  }
+
+  function rememberStrategy(name) {
+    try {
+      var s = loadSettings();
+      s.classnameStrategy = name;
+      saveSettings(s);
+    } catch (e) { /* a cached preference is a nicety, not a requirement */ }
   }
 
   // Does the endpoint accept our session at all? An empty Layouts array is a

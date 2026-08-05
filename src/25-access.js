@@ -40,10 +40,16 @@
         user: profile.user, groups: profile.groups,
       };
       if (!allowed) {
-        console.info(TAG + ' hidden: ' + (profile.user.UserID || 'this user') +
-          ' is in [' + profile.groups.join(', ') + '], none of which is an admin group [' +
-          adminGroups.join(', ') + ']. Adjust with ' +
-          '__issueCreator.setAdminGroups([...]) if this server names them differently.');
+        // Group names are per-instance, so this is the expected first
+        // experience on a new Studio — say plainly how to fix it, since a
+        // missing menu entry gives the user nothing else to go on.
+        console.warn(TAG + ' menu hidden — no admin group matched.\n' +
+          '  user:            ' + (profile.user.UserID || 'unknown') + '\n' +
+          '  member of:       [' + profile.groups.join(', ') + ']\n' +
+          '  looking for any: [' + adminGroups.join(', ') + ']\n' +
+          '  If this instance names its admin group differently, run:\n' +
+          "    __issueCreator.setAdminGroups(['" + (profile.groups[0] || 'Your Group') + "'])\n" +
+          '  then reload Studio.');
       }
       return allowed;
     }).catch(function (e) {

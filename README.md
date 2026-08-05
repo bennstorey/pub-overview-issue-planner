@@ -88,6 +88,32 @@ Users need a hard refresh (Cmd-Shift-R) of Studio after a deploy.
 Only the plug-in is public. The research notes, the superseded Electron PoC and the
 customer context stay in the private parent repo.
 
+## Portability between Studio instances
+
+**The same URL works on any Studio instance.** Nothing instance-specific is baked into the
+bundle: no hostnames, no absolute URLs, no brand/issue/template ids. Server URLs come from
+`window.csConfig.serverUrl`, falling back to `/server/index.php` resolved against
+`location.href`, so they follow whatever origin the plug-in is loaded into. Everything
+else is resolved at runtime from `currentFilterSetting()` and `GetPublications`.
+
+Settings live in `localStorage`, which is per-origin, so instances cannot contaminate each
+other's configuration.
+
+Two things are **version**- or **instance**-specific rather than baked in, and both adapt:
+
+- **`__classname__` type names** are a Studio *version* dependency. The default `pln` is
+  confirmed on 10.67; if a server rejects it, `createLayouts` retries the alternatives and
+  remembers the winner for that origin. The retry only fires on the signature of a
+  deserialization failure — where nothing was created — so a genuine failure such as a name
+  clash is reported immediately rather than risking duplicate layouts.
+- **Admin group names** differ per instance. If none match, the menu entry simply never
+  appears, which gives the user nothing to go on — so the console explains what the user is
+  a member of, what was being looked for, and the exact
+  `__issueCreator.setAdminGroups([...])` call to fix it.
+
+Not automatic: the plug-in has to be registered in each instance's Management Console, and
+`_Issue Plans` / `_Issue Templates` dossiers are created on demand per brand.
+
 ## Architecture
 
 ```
