@@ -53,8 +53,10 @@
     setAllIncluded: setAllIncluded,
     listIssueTemplates: listIssueTemplates,
     saveIssueTemplate: saveIssueTemplate,
-    savePlanDraft: savePlanDraft,
-    loadPlanDraft: loadPlanDraft,
+    savePlanVersion: savePlanVersion,
+    listPlanVersions: listPlanVersions,
+    loadPlanVersion: loadPlanVersion,
+
     access: function () { return accessState; },
     checkAccess: checkAccess,
     // Server-specific: adjust if the admin group is named differently here.

@@ -221,22 +221,71 @@
     });
   }
 
-  // ── plan drafts (one per issue, no pages created) ─────────────────────────
+  // ── plan versions (no pages created) ──────────────────────────────────────
+  // Each save is its own object, so any earlier one can be restored:
+  //
+  //   IssuePlan_<issueId>_v<N>_<YYYY-MM-DD>
+  //
+  // The date comes from the browser at save time, deliberately. Studio's own
+  // `Modified` is in the server's timezone with no offset marker — UTC-4 here —
+  // so listing versions by it showed times hours adrift. Baking the date into
+  // the name at the point of saving sidesteps the question rather than guessing
+  // an offset, and a date alone is what you actually want when picking a version.
 
-  function savePlanDraft(publicationId, categoryId, issueId, config) {
-    var objName = PLAN_PREFIX + issueId;
-    return findObjectsByName(publicationId, objName, '=').then(function (existing) {
-      return deleteObjects(existing.map(function (e) { return e.id; }));
-    }).then(function () {
-      return saveJsonObject(objName, publicationId, categoryId, PLAN_DOSSIER, config);
+  function localDateStamp(d) {
+    d = d || new Date();
+    function two(n) { return String(n).padStart(2, '0'); }
+    return d.getFullYear() + '-' + two(d.getMonth() + 1) + '-' + two(d.getDate());
+  }
+
+  // `IssuePlan_284_v3_2026-08-05` -> { version: 3, date: '2026-08-05' }
+  // Plans saved before versioning have no suffix and are reported as version 0.
+  function parsePlanName(name, issueId) {
+    var prefix = PLAN_PREFIX + issueId;
+    if (name === prefix) return { version: 0, date: '', legacy: true };
+    var m = new RegExp('^' + prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') +
+      '_v(\\d+)(?:_(\\d{4}-\\d{2}-\\d{2}))?$').exec(name);
+    if (!m) return null;
+    return { version: Number(m[1]), date: m[2] || '', legacy: false };
+  }
+
+  // Newest first.
+  function listPlanVersions(publicationId, issueId) {
+    return findObjectsByName(publicationId, PLAN_PREFIX + issueId, 'starts').then(function (rows) {
+      var out = [];
+      for (var i = 0; i < rows.length; i++) {
+        var parsed = parsePlanName(rows[i].name, issueId);
+        if (!parsed) continue; // a different issue whose id starts the same way
+        out.push({
+          id: rows[i].id, name: rows[i].name,
+          version: parsed.version, date: parsed.date, legacy: parsed.legacy,
+          savedBy: rows[i].modifier, modified: rows[i].modified,
+        });
+      }
+      out.sort(function (a, b) { return b.version - a.version; });
+      return out;
     });
   }
 
-  function loadPlanDraft(publicationId, issueId) {
-    return findObjectsByName(publicationId, PLAN_PREFIX + issueId, '=').then(function (rows) {
-      if (!rows.length) return null;
-      return loadJsonObject(rows[0].id).then(function (config) {
-        return { config: config, savedBy: rows[0].modifier, savedAt: rows[0].modified, id: rows[0].id };
-      });
+  function savePlanVersion(publicationId, categoryId, issueId, config) {
+    var keep = loadSettings().planVersionsToKeep;
+    return listPlanVersions(publicationId, issueId).then(function (versions) {
+      var next = versions.length ? versions[0].version + 1 : 1;
+      var stamp = localDateStamp();
+      var objName = PLAN_PREFIX + issueId + '_v' + next + '_' + stamp;
+      config.version = next;
+      config.savedDate = stamp;
+      return saveJsonObject(objName, publicationId, categoryId, PLAN_DOSSIER, config)
+        .then(function (saved) {
+          // Prune oldest beyond the cap, so a long-running issue does not fill
+          // the dossier. Best effort: a failed prune must not fail the save.
+          if (!keep || versions.length + 1 <= keep) return { saved: saved, version: next, date: stamp };
+          var excess = versions.slice(keep - 1); // newest kept are versions[0..keep-2] plus the new one
+          return deleteObjects(excess.map(function (v) { return v.id; }))
+            .catch(function (e) { console.warn(TAG + ' could not prune old plan versions: ' + e.message); })
+            .then(function () { return { saved: saved, version: next, date: stamp, pruned: excess.length }; });
+        });
     });
   }
+
+  function loadPlanVersion(objectId) { return loadJsonObject(objectId); }

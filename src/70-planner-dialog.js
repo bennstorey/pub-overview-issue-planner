@@ -215,19 +215,21 @@
       if (!state.ctx) return Promise.resolve();
       return Promise.all([
         listIssueTemplates(state.ctx.publicationId).catch(function () { return []; }),
-        loadPlanDraft(state.ctx.publicationId, filter.issueId).catch(function () { return null; }),
+        listPlanVersions(state.ctx.publicationId, filter.issueId).catch(function () { return []; }),
       ]).then(function (r) {
         state.savedTemplates = r[0];
-        state.draft = r[1];
+        state.versions = r[1];
         loadSelect.textContent = '';
         loadSelect.appendChild(el('option', { value: '', text: '— load —' }));
-        if (state.draft) {
+        state.versions.forEach(function (v, idx) {
           loadSelect.appendChild(el('option', {
-            value: 'draft',
-            text: 'Saved plan for this issue (' + (state.draft.savedBy || '?') + ', ' +
-              serverTime(state.draft.savedAt) + ')',
+            value: 'plan:' + v.id,
+            text: 'Plan ' + (v.legacy ? '(before versioning)' : 'v' + v.version) +
+              (v.date ? ' · ' + v.date : '') +
+              (v.savedBy ? ' · ' + v.savedBy : '') +
+              (idx === 0 && !v.legacy ? ' · latest' : ''),
           }));
-        }
+        });
         state.savedTemplates.forEach(function (t) {
           loadSelect.appendChild(el('option', { value: 'tpl:' + t.id, text: 'Template: ' + t.name }));
         });
@@ -238,9 +240,10 @@
       if (!state.ctx || state.busy) return;
       state.busy = true;
       setStatus('Saving plan…');
-      savePlanDraft(state.ctx.publicationId, state.ctx.sectionId, filter.issueId, arrangementPayload())
-        .then(function () {
-          setStatus('Plan saved for ' + state.ctx.issue + '. Nothing was created.', 'ok');
+      savePlanVersion(state.ctx.publicationId, state.ctx.sectionId, filter.issueId, arrangementPayload())
+        .then(function (res) {
+          setStatus('Saved as v' + res.version + ' (' + res.date + '). Nothing was created' +
+            (res.pruned ? '; ' + res.pruned + ' old version(s) removed.' : '.'), 'ok');
           return refreshLoadList();
         })
         .catch(function (e) { setStatus('Could not save the plan: ' + e.message, 'error'); })
@@ -284,17 +287,20 @@
           res.skipped.length ? 'error' : 'ok');
       }
 
-      if (v === 'draft' && state.draft) {
-        apply(state.draft.config, false, 'the saved plan');
-        return;
-      }
-      var id = v.replace(/^tpl:/, '');
+      var isPlan = v.indexOf('plan:') === 0;
+      var id = v.replace(/^(plan|tpl):/, '');
+      var meta = isPlan ? (state.versions || []).filter(function (x) { return x.id === id; })[0] : null;
+
       state.busy = true;
-      setStatus('Loading template…');
+      setStatus(isPlan ? 'Loading plan…' : 'Loading template…');
       loadJsonObject(id).then(function (cfg) {
-        // An issue template is an ordered sequence, so lay it out from the first
-        // free page rather than at the page numbers it happened to be saved at.
-        apply(cfg, true, 'the template');
+        // A plan belongs to this issue, so restore it at the page numbers it was
+        // saved at. An issue template is an ordered sequence with no issue of its
+        // own, so lay it out from the first free page instead.
+        apply(cfg, !isPlan, isPlan
+          ? ('plan ' + (meta && !meta.legacy ? 'v' + meta.version : '(before versioning)') +
+             (meta && meta.date ? ' from ' + meta.date : ''))
+          : 'the template');
       }).catch(function (e) {
         setStatus('Could not load: ' + e.message, 'error');
       }).then(function () { state.busy = false; refresh(); });
@@ -329,9 +335,12 @@
       // has something to resolve template names against.
       return refreshLoadList();
     }).then(function () {
-      if (state.draft) {
-        setStatus('A saved plan exists for this issue — ' + (state.draft.savedBy || '?') +
-          ', ' + serverTime(state.draft.savedAt) + '. Pick it under Load to restore it.');
+      var vs = state.versions || [];
+      if (vs.length) {
+        setStatus(vs.length + ' saved plan version(s) for this issue — latest ' +
+          (vs[0].legacy ? '(before versioning)' : 'v' + vs[0].version) +
+          (vs[0].date ? ' from ' + vs[0].date : '') +
+          (vs[0].savedBy ? ' by ' + vs[0].savedBy : '') + '. Pick one under Load to restore it.');
       }
     }).catch(function (e) {
       ctxLine.textContent = 'failed';

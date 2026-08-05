@@ -27,8 +27,8 @@ Open **Create pages…** in the Publication Overview triple-dot menu:
   would land on a page already in the issue is refused
 - **Tick or untick pages** to create only some of them. Everything is included by default,
   so a partial run is a deliberate act; `All` / `None` for the common cases
-- **Save plan** stores work in progress on this issue without creating anything —
-  one draft per issue, and reopening the issue offers to restore it
+- **Save plan** stores work in progress on this issue without creating anything. Every
+  save is a new version, so you can go back to any earlier one
 - **Save as template…** stores a named, reusable arrangement not tied to any issue.
   Loading one lays its sequence out from the first free page, so it fits around pages that
   already exist rather than colliding with them
@@ -189,13 +189,29 @@ person's browser. Object type `Other`, format `text/plain`, contained in a dossi
 
 | | Object | Dossier |
 |---|---|---|
-| Plan draft — work in progress on one issue | `IssuePlan_<issueId>` | `_Issue Plans` |
+| Plan version — work in progress on one issue | `IssuePlan_<issueId>_v<N>_<YYYY-MM-DD>` | `_Issue Plans` |
 | Issue template — named, reusable, not tied to an issue | `IssueTemplate_<name>` | `_Issue Templates` |
 
-Both are overwritten on save rather than accumulating duplicates. Neither stores existing
-pages: those belong to the issue, not the plan, and are re-read fresh every time. When a
-saved arrangement is restored, entries whose pages have been created in the meantime are
-skipped and reported rather than silently dropped.
+**Every save of a plan is a new version**, so any earlier one can be restored from the Load
+list. Old versions are pruned beyond `planVersionsToKeep` (20 by default; 0 keeps
+everything). Issue templates are still overwritten by name, since they are named things
+rather than a history.
+
+The **date in the name comes from the browser** at save time, deliberately. Studio's own
+`Modified` is in the server's timezone with no offset marker — UTC-4 on this server — so
+listing versions by it showed times hours adrift. Baking the date in at the point of
+saving sidesteps the question rather than guessing an offset, and a date is what you
+actually want when picking a version.
+
+Plans saved before versioning existed have no suffix and are listed as "before
+versioning". Issue ids that share a prefix do not collide: `IssuePlan_2840_v1` is not
+matched when listing versions of issue 284.
+
+Neither kind stores existing pages: those belong to the issue, not the plan, and are
+re-read fresh every time. Restoring a plan puts it back at the page numbers it was saved
+at; loading an issue template lays its sequence out from the first free page. Either way,
+entries whose pages have been created in the meantime are skipped and reported rather than
+silently dropped.
 
 ### How the bytes get there
 

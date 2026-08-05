@@ -21,7 +21,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '0.5.0';
+  var VERSION = '0.6.0';
   var TAG = '[issue-creator]';
 
   if (typeof PoUiSdk === 'undefined') {
@@ -69,6 +69,9 @@
     // Only members of these user groups see the tool. Names differ between
     // servers, so this is a setting: __issueCreator.setAdminGroups([...]).
     adminGroups: ['Admin', 'Administrators', 'System Admin'],
+    // How many saved versions of a plan to keep per issue; older ones are
+    // deleted on save. 0 keeps everything.
+    planVersionsToKeep: 20,
   };
 
   var SETTINGS_KEY = 'issueCreator.settings';
@@ -685,25 +688,74 @@
     });
   }
 
-  // ── plan drafts (one per issue, no pages created) ─────────────────────────
+  // ── plan versions (no pages created) ──────────────────────────────────────
+  // Each save is its own object, so any earlier one can be restored:
+  //
+  //   IssuePlan_<issueId>_v<N>_<YYYY-MM-DD>
+  //
+  // The date comes from the browser at save time, deliberately. Studio's own
+  // `Modified` is in the server's timezone with no offset marker — UTC-4 here —
+  // so listing versions by it showed times hours adrift. Baking the date into
+  // the name at the point of saving sidesteps the question rather than guessing
+  // an offset, and a date alone is what you actually want when picking a version.
 
-  function savePlanDraft(publicationId, categoryId, issueId, config) {
-    var objName = PLAN_PREFIX + issueId;
-    return findObjectsByName(publicationId, objName, '=').then(function (existing) {
-      return deleteObjects(existing.map(function (e) { return e.id; }));
-    }).then(function () {
-      return saveJsonObject(objName, publicationId, categoryId, PLAN_DOSSIER, config);
+  function localDateStamp(d) {
+    d = d || new Date();
+    function two(n) { return String(n).padStart(2, '0'); }
+    return d.getFullYear() + '-' + two(d.getMonth() + 1) + '-' + two(d.getDate());
+  }
+
+  // `IssuePlan_284_v3_2026-08-05` -> { version: 3, date: '2026-08-05' }
+  // Plans saved before versioning have no suffix and are reported as version 0.
+  function parsePlanName(name, issueId) {
+    var prefix = PLAN_PREFIX + issueId;
+    if (name === prefix) return { version: 0, date: '', legacy: true };
+    var m = new RegExp('^' + prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') +
+      '_v(\\d+)(?:_(\\d{4}-\\d{2}-\\d{2}))?$').exec(name);
+    if (!m) return null;
+    return { version: Number(m[1]), date: m[2] || '', legacy: false };
+  }
+
+  // Newest first.
+  function listPlanVersions(publicationId, issueId) {
+    return findObjectsByName(publicationId, PLAN_PREFIX + issueId, 'starts').then(function (rows) {
+      var out = [];
+      for (var i = 0; i < rows.length; i++) {
+        var parsed = parsePlanName(rows[i].name, issueId);
+        if (!parsed) continue; // a different issue whose id starts the same way
+        out.push({
+          id: rows[i].id, name: rows[i].name,
+          version: parsed.version, date: parsed.date, legacy: parsed.legacy,
+          savedBy: rows[i].modifier, modified: rows[i].modified,
+        });
+      }
+      out.sort(function (a, b) { return b.version - a.version; });
+      return out;
     });
   }
 
-  function loadPlanDraft(publicationId, issueId) {
-    return findObjectsByName(publicationId, PLAN_PREFIX + issueId, '=').then(function (rows) {
-      if (!rows.length) return null;
-      return loadJsonObject(rows[0].id).then(function (config) {
-        return { config: config, savedBy: rows[0].modifier, savedAt: rows[0].modified, id: rows[0].id };
-      });
+  function savePlanVersion(publicationId, categoryId, issueId, config) {
+    var keep = loadSettings().planVersionsToKeep;
+    return listPlanVersions(publicationId, issueId).then(function (versions) {
+      var next = versions.length ? versions[0].version + 1 : 1;
+      var stamp = localDateStamp();
+      var objName = PLAN_PREFIX + issueId + '_v' + next + '_' + stamp;
+      config.version = next;
+      config.savedDate = stamp;
+      return saveJsonObject(objName, publicationId, categoryId, PLAN_DOSSIER, config)
+        .then(function (saved) {
+          // Prune oldest beyond the cap, so a long-running issue does not fill
+          // the dossier. Best effort: a failed prune must not fail the save.
+          if (!keep || versions.length + 1 <= keep) return { saved: saved, version: next, date: stamp };
+          var excess = versions.slice(keep - 1); // newest kept are versions[0..keep-2] plus the new one
+          return deleteObjects(excess.map(function (v) { return v.id; }))
+            .catch(function (e) { console.warn(TAG + ' could not prune old plan versions: ' + e.message); })
+            .then(function () { return { saved: saved, version: next, date: stamp, pruned: excess.length }; });
+        });
     });
   }
+
+  function loadPlanVersion(objectId) { return loadJsonObject(objectId); }
 
   // ─── Layout templates ──────────────────────────────────────────────────────
 
@@ -1600,19 +1652,21 @@
       if (!state.ctx) return Promise.resolve();
       return Promise.all([
         listIssueTemplates(state.ctx.publicationId).catch(function () { return []; }),
-        loadPlanDraft(state.ctx.publicationId, filter.issueId).catch(function () { return null; }),
+        listPlanVersions(state.ctx.publicationId, filter.issueId).catch(function () { return []; }),
       ]).then(function (r) {
         state.savedTemplates = r[0];
-        state.draft = r[1];
+        state.versions = r[1];
         loadSelect.textContent = '';
         loadSelect.appendChild(el('option', { value: '', text: '— load —' }));
-        if (state.draft) {
+        state.versions.forEach(function (v, idx) {
           loadSelect.appendChild(el('option', {
-            value: 'draft',
-            text: 'Saved plan for this issue (' + (state.draft.savedBy || '?') + ', ' +
-              serverTime(state.draft.savedAt) + ')',
+            value: 'plan:' + v.id,
+            text: 'Plan ' + (v.legacy ? '(before versioning)' : 'v' + v.version) +
+              (v.date ? ' · ' + v.date : '') +
+              (v.savedBy ? ' · ' + v.savedBy : '') +
+              (idx === 0 && !v.legacy ? ' · latest' : ''),
           }));
-        }
+        });
         state.savedTemplates.forEach(function (t) {
           loadSelect.appendChild(el('option', { value: 'tpl:' + t.id, text: 'Template: ' + t.name }));
         });
@@ -1623,9 +1677,10 @@
       if (!state.ctx || state.busy) return;
       state.busy = true;
       setStatus('Saving plan…');
-      savePlanDraft(state.ctx.publicationId, state.ctx.sectionId, filter.issueId, arrangementPayload())
-        .then(function () {
-          setStatus('Plan saved for ' + state.ctx.issue + '. Nothing was created.', 'ok');
+      savePlanVersion(state.ctx.publicationId, state.ctx.sectionId, filter.issueId, arrangementPayload())
+        .then(function (res) {
+          setStatus('Saved as v' + res.version + ' (' + res.date + '). Nothing was created' +
+            (res.pruned ? '; ' + res.pruned + ' old version(s) removed.' : '.'), 'ok');
           return refreshLoadList();
         })
         .catch(function (e) { setStatus('Could not save the plan: ' + e.message, 'error'); })
@@ -1669,17 +1724,20 @@
           res.skipped.length ? 'error' : 'ok');
       }
 
-      if (v === 'draft' && state.draft) {
-        apply(state.draft.config, false, 'the saved plan');
-        return;
-      }
-      var id = v.replace(/^tpl:/, '');
+      var isPlan = v.indexOf('plan:') === 0;
+      var id = v.replace(/^(plan|tpl):/, '');
+      var meta = isPlan ? (state.versions || []).filter(function (x) { return x.id === id; })[0] : null;
+
       state.busy = true;
-      setStatus('Loading template…');
+      setStatus(isPlan ? 'Loading plan…' : 'Loading template…');
       loadJsonObject(id).then(function (cfg) {
-        // An issue template is an ordered sequence, so lay it out from the first
-        // free page rather than at the page numbers it happened to be saved at.
-        apply(cfg, true, 'the template');
+        // A plan belongs to this issue, so restore it at the page numbers it was
+        // saved at. An issue template is an ordered sequence with no issue of its
+        // own, so lay it out from the first free page instead.
+        apply(cfg, !isPlan, isPlan
+          ? ('plan ' + (meta && !meta.legacy ? 'v' + meta.version : '(before versioning)') +
+             (meta && meta.date ? ' from ' + meta.date : ''))
+          : 'the template');
       }).catch(function (e) {
         setStatus('Could not load: ' + e.message, 'error');
       }).then(function () { state.busy = false; refresh(); });
@@ -1714,9 +1772,12 @@
       // has something to resolve template names against.
       return refreshLoadList();
     }).then(function () {
-      if (state.draft) {
-        setStatus('A saved plan exists for this issue — ' + (state.draft.savedBy || '?') +
-          ', ' + serverTime(state.draft.savedAt) + '. Pick it under Load to restore it.');
+      var vs = state.versions || [];
+      if (vs.length) {
+        setStatus(vs.length + ' saved plan version(s) for this issue — latest ' +
+          (vs[0].legacy ? '(before versioning)' : 'v' + vs[0].version) +
+          (vs[0].date ? ' from ' + vs[0].date : '') +
+          (vs[0].savedBy ? ' by ' + vs[0].savedBy : '') + '. Pick one under Load to restore it.');
       }
     }).catch(function (e) {
       ctxLine.textContent = 'failed';
@@ -1841,8 +1902,10 @@
     setAllIncluded: setAllIncluded,
     listIssueTemplates: listIssueTemplates,
     saveIssueTemplate: saveIssueTemplate,
-    savePlanDraft: savePlanDraft,
-    loadPlanDraft: loadPlanDraft,
+    savePlanVersion: savePlanVersion,
+    listPlanVersions: listPlanVersions,
+    loadPlanVersion: loadPlanVersion,
+
     access: function () { return accessState; },
     checkAccess: checkAccess,
     // Server-specific: adjust if the admin group is named differently here.

@@ -10,6 +10,9 @@
     // Only members of these user groups see the tool. Names differ between
     // servers, so this is a setting: __issueCreator.setAdminGroups([...]).
     adminGroups: ['Admin', 'Administrators', 'System Admin'],
+    // How many saved versions of a plan to keep per issue; older ones are
+    // deleted on save. 0 keeps everything.
+    planVersionsToKeep: 20,
   };
 
   var SETTINGS_KEY = 'issueCreator.settings';
