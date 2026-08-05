@@ -7,6 +7,9 @@
     defaultTemplateId: null,
     // Anything whose name contains this is offered as the blank-page template.
     blankTemplateHint: 'blank',
+    // Only members of these user groups see the tool. Names differ between
+    // servers, so this is a setting: __issueCreator.setAdminGroups([...]).
+    adminGroups: ['Admin', 'Administrators', 'System Admin'],
   };
 
   var SETTINGS_KEY = 'issueCreator.settings';

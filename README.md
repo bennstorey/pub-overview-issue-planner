@@ -160,6 +160,28 @@ category of its own.
 resolved `Publication` / `Issue` / `PubChannel` / `Section` / `Status`, but `Pages` comes
 back `null`. Verify with `loadIssueModel()` or by reading `PlannedPageRange`.
 
+## Who can see it
+
+The menu entry only appears for members of an admin user group. The check is
+`GetUserProfile` with `RequestInfo: ['Memberships']`; group names differ between servers,
+so the list is a setting (`Admin`, `Administrators`, `System Admin` by default):
+
+```js
+__issueCreator.setAdminGroups(['Admin'])   // then reload Studio
+```
+
+The action is created hidden and revealed once the check passes, because `createAction`
+has to run while the menu is being built — registering later, after an async check, is not
+reliable. If the check itself fails the entry stays hidden: a restriction that opens up
+when it breaks is not a restriction. `__issueCreator.access()` shows what was decided and
+why.
+
+⚠️ **This is not a security boundary.** The bundle is fetched from a public URL and runs in
+the user's own browser, so anyone determined can edit the check out or call the Planning
+API directly. What actually prevents a non-admin creating pages is Studio's own access
+rights — the server refuses the calls. This gate keeps the menu entry out of the way of
+people who have no business using it, which is a usability guarantee, not a security one.
+
 ## Saved arrangements
 
 Both kinds live **in Studio**, so they are visible to everyone rather than trapped in one
@@ -187,6 +209,13 @@ a second endpoint. **The server rejects it**: `Unable to save attached data to f
 (S1001) — Missing function parameter (S1000)`. `Content` is a documented field on
 `Attachment`, but this server will not accept it. Reading still handles inline content in
 case another version returns it that way.
+
+## Notes on times
+
+Studio returns datetimes in the **server's** timezone, with no offset marker, and that
+timezone is neither the viewer's nor necessarily UTC — this server records **UTC-4**, so a
+plan saved at 06:49 BST is stored as `01:49`. Parsing those strings as local time would
+silently shift every timestamp, so they are shown verbatim and labelled "server time".
 
 ## Notes
 

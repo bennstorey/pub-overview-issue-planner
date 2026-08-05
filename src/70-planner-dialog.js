@@ -225,7 +225,7 @@
           loadSelect.appendChild(el('option', {
             value: 'draft',
             text: 'Saved plan for this issue (' + (state.draft.savedBy || '?') + ', ' +
-              String(state.draft.savedAt || '').slice(0, 16).replace('T', ' ') + ')',
+              serverTime(state.draft.savedAt) + ')',
           }));
         }
         state.savedTemplates.forEach(function (t) {
@@ -330,8 +330,8 @@
       return refreshLoadList();
     }).then(function () {
       if (state.draft) {
-        setStatus('A saved plan exists for this issue (' + (state.draft.savedBy || '?') +
-          '). Pick it under Load to restore it.');
+        setStatus('A saved plan exists for this issue — ' + (state.draft.savedBy || '?') +
+          ', ' + serverTime(state.draft.savedAt) + '. Pick it under Load to restore it.');
       }
     }).catch(function (e) {
       ctxLine.textContent = 'failed';

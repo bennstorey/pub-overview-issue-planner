@@ -21,7 +21,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '0.4.1';
+  var VERSION = '0.5.0';
   var TAG = '[issue-creator]';
 
   if (typeof PoUiSdk === 'undefined') {
@@ -33,6 +33,17 @@
 
   // ─── DOM helper ────────────────────────────────────────────────────────────
   // Shared by the grid and the dialog, so it lives ahead of both.
+
+  // Studio returns datetimes in the *server's* timezone with no offset marker,
+  // and that timezone is not necessarily the viewer's or even UTC — this server
+  // records UTC-4 while the browser sits in BST, so a plan saved at 06:49 local
+  // reads 01:49. Rendering it as if it were local time is worse than not
+  // converting, so show it verbatim and say whose clock it is.
+  function serverTime(value) {
+    var s = String(value || '').trim();
+    if (!s) return 'unknown time';
+    return s.slice(0, 16).replace('T', ' ') + ' server time';
+  }
 
   function el(tag, props, children) {
     var node = document.createElement(tag);
@@ -55,6 +66,9 @@
     defaultTemplateId: null,
     // Anything whose name contains this is offered as the blank-page template.
     blankTemplateHint: 'blank',
+    // Only members of these user groups see the tool. Names differ between
+    // servers, so this is a setting: __issueCreator.setAdminGroups([...]).
+    adminGroups: ['Admin', 'Administrators', 'System Admin'],
   };
 
   var SETTINGS_KEY = 'issueCreator.settings';
@@ -139,6 +153,63 @@
 
   function currentFilter() {
     try { return PoUiSdk.currentFilterSetting() || {}; } catch (e) { return {}; }
+  }
+
+  // ─── Access check ──────────────────────────────────────────────────────────
+  // Restricts the tool to administrators.
+  //
+  // IMPORTANT: this is not a security boundary. The bundle is fetched from a
+  // public URL and runs in the user's own browser, so anyone determined can edit
+  // it out or call the Planning API directly. What actually stops a non-admin
+  // creating pages is Studio's own access rights — the server refuses the calls.
+  // This check keeps the menu entry out of the way of people who have no
+  // business using it, which is a usability guarantee, not a security one.
+
+  var accessState = { checked: false, allowed: false, user: null, groups: [] };
+
+  function loadUserProfile() {
+    return callServer('GetUserProfile', { RequestInfo: ['Memberships'] }).then(function (r) {
+      var user = r.CurrentUser || {};
+      var groups = (r.Memberships || []).map(function (g) { return g.Name; });
+      return { user: user, groups: groups };
+    });
+  }
+
+  // Group names vary between servers, so the list is a setting rather than a
+  // constant — see DEFAULTS.adminGroups.
+  function isAdminGroup(name, adminGroups) {
+    var n = String(name || '').trim().toLowerCase();
+    for (var i = 0; i < adminGroups.length; i++) {
+      if (n === String(adminGroups[i]).trim().toLowerCase()) return true;
+    }
+    return false;
+  }
+
+  function checkAccess() {
+    var adminGroups = loadSettings().adminGroups || [];
+    return loadUserProfile().then(function (profile) {
+      var allowed = false;
+      for (var i = 0; i < profile.groups.length; i++) {
+        if (isAdminGroup(profile.groups[i], adminGroups)) { allowed = true; break; }
+      }
+      accessState = {
+        checked: true, allowed: allowed,
+        user: profile.user, groups: profile.groups,
+      };
+      if (!allowed) {
+        console.info(TAG + ' hidden: ' + (profile.user.UserID || 'this user') +
+          ' is in [' + profile.groups.join(', ') + '], none of which is an admin group [' +
+          adminGroups.join(', ') + ']. Adjust with ' +
+          '__issueCreator.setAdminGroups([...]) if this server names them differently.');
+      }
+      return allowed;
+    }).catch(function (e) {
+      // Fail closed: a restriction that opens up when the check breaks is not a
+      // restriction. Logged loudly so it is diagnosable rather than mysterious.
+      accessState = { checked: true, allowed: false, user: null, groups: [], error: e.message };
+      console.warn(TAG + ' access check failed, staying hidden: ' + e.message);
+      return false;
+    });
   }
 
   // ─── Planning API (editorialplan.php) ─────────────────────────────────────
@@ -1539,7 +1610,7 @@
           loadSelect.appendChild(el('option', {
             value: 'draft',
             text: 'Saved plan for this issue (' + (state.draft.savedBy || '?') + ', ' +
-              String(state.draft.savedAt || '').slice(0, 16).replace('T', ' ') + ')',
+              serverTime(state.draft.savedAt) + ')',
           }));
         }
         state.savedTemplates.forEach(function (t) {
@@ -1644,8 +1715,8 @@
       return refreshLoadList();
     }).then(function () {
       if (state.draft) {
-        setStatus('A saved plan exists for this issue (' + (state.draft.savedBy || '?') +
-          '). Pick it under Load to restore it.');
+        setStatus('A saved plan exists for this issue — ' + (state.draft.savedBy || '?') +
+          ', ' + serverTime(state.draft.savedAt) + '. Pick it under Load to restore it.');
       }
     }).catch(function (e) {
       ctxLine.textContent = 'failed';
@@ -1716,11 +1787,17 @@
   }
 
   // ─── Registration & lifecycle ──────────────────────────────────────────────
+  // The action is created hidden and only revealed once the access check
+  // passes, because createAction has to happen while the menu is being built —
+  // registering later, after an async check, is not reliable.
+  var actionId = null;
   try {
     if (PoUiSdk.hasActions()) PoUiSdk.createAction(); // separator below other plug-ins
-    PoUiSdk.createAction({
+    actionId = PoUiSdk.createAction({
       label: 'Create pages…',
+      visible: false,
       click: function () {
+        if (!accessState.allowed) return; // belt and braces
         try { openPlannerDialog(); }
         catch (e) {
           console.error(TAG + ' planner dialog failed:', e);
@@ -1731,6 +1808,12 @@
   } catch (e) {
     console.error(TAG + ' could not register menu action:', e);
   }
+
+  checkAccess().then(function (allowed) {
+    if (!allowed || !actionId) return;
+    try { PoUiSdk.changeAction(actionId, { visible: true }); }
+    catch (e) { console.error(TAG + ' could not reveal the menu action:', e); }
+  });
 
   // Console diagnostics: window.__issueCreator
   window.__issueCreator = {
@@ -1760,6 +1843,16 @@
     saveIssueTemplate: saveIssueTemplate,
     savePlanDraft: savePlanDraft,
     loadPlanDraft: loadPlanDraft,
+    access: function () { return accessState; },
+    checkAccess: checkAccess,
+    // Server-specific: adjust if the admin group is named differently here.
+    // Takes effect on the next page load.
+    setAdminGroups: function (groups) {
+      var s = loadSettings();
+      s.adminGroups = groups;
+      saveSettings(s);
+      console.info(TAG + ' admin groups set to [' + groups.join(', ') + ']; reload Studio to apply.');
+    },
   };
 
   console.info(TAG + ' v' + VERSION + ' loaded');
